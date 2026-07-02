@@ -303,6 +303,10 @@ pub fn materialize_codex_subscription_for_local_router(
     let mut changed = ensure_codex_subscription_endpoint(&mut cfg);
     changed |= ensure_codex_subscription_main_route(&mut cfg);
     changed |= rewrite_subscription_routes_for_codex(&mut cfg);
+    // After the rewrite `routes.main` is the concrete codex-subscription endpoint,
+    // so the shared sentinel-pinning helper points Codex's default `--model` at it
+    // — same path the non-subscription `--config` case uses.
+    changed |= ensure_codex_config_model_routes(&mut cfg);
     if !changed {
         return Ok(path.to_path_buf());
     }
@@ -316,6 +320,78 @@ pub fn materialize_codex_subscription_for_local_router(
     let body = serde_json::to_vec_pretty(&cfg).map_err(io::Error::other)?;
     std::fs::write(&out, body)?;
     Ok(out)
+}
+
+/// Non-subscription Codex `--config` (e.g. a local/ollama or provider main): like
+/// [`materialize_for_local_router`] but also pins Codex's sentinel `--model`
+/// (`rayline-local`/`rayline-codex`) to `routes.main` (see
+/// [`ensure_codex_config_model_routes`]), so the default request reaches the
+/// configured main endpoint instead of the built-in on-device local slot.
+pub fn materialize_codex_config_for_local_router(path: &Path, home: &Path) -> io::Result<PathBuf> {
+    let raw = std::fs::read(path)?;
+    let mut cfg: Value = serde_json::from_slice(&raw).map_err(io::Error::other)?;
+    let mut changed = ensure_codex_config_model_routes(&mut cfg);
+    // Same passthrough handling as materialize_for_local_router: the local router
+    // has no `subscription` endpoint, so strip a passthrough `main` (that combo is
+    // for `--auth subscription`, which uses a different materialization).
+    if config_value_main_is_passthrough(&cfg) {
+        if let Some(routes) = cfg.get_mut("routes").and_then(Value::as_object_mut) {
+            changed |= routes.remove("main").is_some();
+        }
+    }
+    if !changed {
+        return Ok(path.to_path_buf());
+    }
+    let out = home
+        .join(".rayline")
+        .join("rld")
+        .join("codex-config-routes.json");
+    if let Some(dir) = out.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let body = serde_json::to_vec_pretty(&cfg).map_err(io::Error::other)?;
+    std::fs::write(&out, body)?;
+    Ok(out)
+}
+
+/// Pin Codex's sentinel `--model` to `routes.main`. Codex sends `rayline-local`
+/// (default) or `rayline-codex`, which would otherwise match the local router's
+/// built-in `model:rayline-local` route and land on the on-device local slot
+/// instead of `routes.main`. Clone the main route onto both sentinels so the
+/// default request reaches the configured main endpoint. Skips the `subscription`
+/// passthrough sentinel (no concrete endpoint here — that's the `--auth
+/// subscription` path) and leaves existing model_routes entries untouched.
+fn ensure_codex_config_model_routes(cfg: &mut Value) -> bool {
+    let Some(main_route) = cfg
+        .get("routes")
+        .and_then(|routes| routes.get("main"))
+        .cloned()
+    else {
+        return false;
+    };
+    if route_endpoint(&main_route).as_deref() == Some(SUBSCRIPTION_MAIN) {
+        return false;
+    }
+    let routes = cfg
+        .as_object_mut()
+        .map(|object| object.entry("routes").or_insert_with(|| json!({})))
+        .and_then(Value::as_object_mut);
+    let Some(routes) = routes else {
+        return false;
+    };
+    let model_routes = routes.entry("model_routes").or_insert_with(|| json!({}));
+    let Some(model_routes) = model_routes.as_object_mut() else {
+        return false;
+    };
+    let mut changed = false;
+    for model in ["rayline-local", "rayline-codex"] {
+        if model_routes.contains_key(model) {
+            continue;
+        }
+        model_routes.insert(model.to_owned(), main_route.clone());
+        changed = true;
+    }
+    changed
 }
 
 fn ensure_codex_subscription_endpoint(cfg: &mut Value) -> bool {
@@ -776,6 +852,94 @@ mod tests {
                 && endpoint["base_url"] == crate::codex::CODEX_SUBSCRIPTION_BASE_URL
         }));
         assert_eq!(cfg["routes"]["subagent"]["endpoint"], "ollama");
+        // Codex's default sentinel models must pin to the subscription endpoint,
+        // else they fall through to the built-in local route and 502.
+        for model in ["rayline-local", "rayline-codex"] {
+            assert_eq!(
+                cfg["routes"]["model_routes"][model]["endpoint"],
+                crate::codex::CODEX_SUBSCRIPTION_ENDPOINT_ID,
+                "model_route {model} should target the subscription endpoint"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn materialize_codex_config_pins_sentinel_models_to_main() {
+        // Non-subscription Codex --config (local main): the sentinel --model must
+        // route to routes.main (ollama), not the built-in on-device local slot.
+        let home = tmp_home();
+        let path = home.join("codex-local.json");
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&json!({
+                "endpoints": [{
+                    "id": "ollama",
+                    "protocol": "openai_chat",
+                    "base_url": "http://127.0.0.1:11434/v1",
+                    "models": ["qwen3.5:9b"]
+                }],
+                "routes": {
+                    "main": {"endpoint": "ollama", "model": "qwen3.5:9b"},
+                    "subagent": {"endpoint": "ollama", "model": "qwen3.5:9b"}
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let out = materialize_codex_config_for_local_router(&path, &home).unwrap();
+        let cfg: Value = serde_json::from_slice(&std::fs::read(&out).unwrap()).unwrap();
+        for model in ["rayline-local", "rayline-codex"] {
+            assert_eq!(
+                cfg["routes"]["model_routes"][model]["endpoint"], "ollama",
+                "sentinel {model} should route to the configured main endpoint"
+            );
+            assert_eq!(cfg["routes"]["model_routes"][model]["model"], "qwen3.5:9b");
+        }
+        // main + subagent untouched.
+        assert_eq!(cfg["routes"]["main"]["endpoint"], "ollama");
+        assert_eq!(cfg["routes"]["subagent"]["endpoint"], "ollama");
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn materialize_codex_config_skips_subscription_passthrough_main() {
+        // A passthrough (subscription) main has no concrete endpoint here, so no
+        // sentinel model_routes are injected and main is stripped (like the
+        // non-codex materialization) — that combo is for --auth subscription.
+        let home = tmp_home();
+        let path = home.join("codex-passthrough.json");
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&json!({
+                "endpoints": [{
+                    "id": "ollama",
+                    "protocol": "openai_chat",
+                    "base_url": "http://127.0.0.1:11434/v1",
+                    "models": ["qwen3.5:9b"]
+                }],
+                "routes": {
+                    "main": {"endpoint": "subscription"},
+                    "subagent": {"endpoint": "ollama", "model": "qwen3.5:9b"}
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let out = materialize_codex_config_for_local_router(&path, &home).unwrap();
+        let cfg: Value = serde_json::from_slice(&std::fs::read(&out).unwrap()).unwrap();
+        assert!(
+            cfg["routes"].get("main").is_none(),
+            "passthrough main stripped"
+        );
+        assert!(
+            cfg["routes"].get("model_routes").is_none(),
+            "no sentinel routes injected for a passthrough main"
+        );
 
         let _ = std::fs::remove_dir_all(&home);
     }
