@@ -285,6 +285,51 @@ Notes:
   router. Main-thread Claude Code traffic still passes through normally under
   `--route subagents`.
 
+## One Model For Everything (`routes.main` Only)
+
+`routes.subagent` is optional. A config that declares `routes.main` and no
+`routes.subagent` routes **subagents to the same target as main**, so a
+single-model setup needs one route entry:
+
+```json
+{
+  "endpoints": [
+    {
+      "id": "openrouter",
+      "protocol": "anthropic_messages",
+      "base_url": "https://openrouter.ai/api",
+      "api_key_env": "OPENROUTER_API_KEY",
+      "auth": "bearer",
+      "models": ["moonshotai/kimi-k2.6"]
+    }
+  ],
+  "routes": {
+    "main": { "endpoint": "openrouter", "model": "moonshotai/kimi-k2.6" }
+  }
+}
+```
+
+```bash
+export OPENROUTER_API_KEY=<your-api-key>
+rayline codex app --config ./kimi.json     # or: rayline claude --config ./kimi.json
+```
+
+Resolution order for a subagent turn is: a matching `routes.subagents.<type>`
+entry → `routes.subagent` → `routes.main` → `routes.default`. Add
+`routes.subagent` only when subagents should differ from main (for example main
+on a frontier model, subagents on-device):
+
+```json
+"routes": {
+  "main": { "endpoint": "openrouter", "model": "moonshotai/kimi-k2.6" },
+  "subagent": { "endpoint": "local" }
+}
+```
+
+The same applies to the hosted cloud router: the default
+`~/.config/rayline/router.json` needs only its `main` entry, and subagents follow
+whatever model the Rayline dashboard selects for that route.
+
 ## Connecting Provider Endpoints
 
 Provider endpoints go in the same static router config. Keep API keys in env vars
@@ -553,6 +598,23 @@ To force a clean restart:
 rayline router stop
 rayline claude --local --isolated --router-config-path ~/.config/rayline/local-router.json
 ```
+
+If a turn fails with a provider-side error (Codex shows "Provider returned
+error"), the router log now records the upstream status:
+
+```
+WARN rayline_local_router: upstream returned HTTP 400 (task=main selected=…)
+```
+
+The response body is passed through to the client untouched — read it there for
+the provider's own message. Two payload shapes providers commonly reject are
+already handled on the Codex path, so they are not the cause:
+
+- Tool names namespaced with characters outside `[A-Za-z][A-Za-z0-9_-]*`
+  (`server.tool`, `server/tool`) are rewritten on the way upstream and restored
+  on the way back.
+- Empty text blocks (a replayed assistant turn that was only a tool call, a
+  cancelled stream) are pruned before the request is sent.
 
 To validate the full end-to-end Claude Code path through Rayline Local, see
 [Acceptance testing](acceptance-testing.md).

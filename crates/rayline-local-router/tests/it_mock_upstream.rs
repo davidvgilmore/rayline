@@ -743,3 +743,174 @@ async fn config_routes_main_and_subagent_to_distinct_endpoints() {
     let _ = std::fs::remove_file(path);
     println!("PASS config drives main→main-ep, subagent→sub-ep over HTTP");
 }
+
+/// Single-model config (`routes.main` only, no `routes.subagent`): BOTH the main
+/// turn and a subagent turn must reach the one configured endpoint/model over
+/// real HTTP. Without the main-inheritance fallback, subagent turns would be
+/// redirected to the on-device adapter the config never mentions.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn main_only_config_routes_subagents_to_main_over_http() {
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_port = upstream.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        // Two sequential requests (main, then subagent) on the same upstream.
+        for _ in 0..2 {
+            if let Ok((mut sock, _)) = upstream.accept().await {
+                let mut buf = [0u8; 16384];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock
+                    .write_all(anthropic_sse("ONE-MODEL-OK").as_bytes())
+                    .await;
+                let _ = sock.flush().await;
+                let _ = sock.shutdown().await;
+            }
+        }
+    });
+
+    let port = free_port();
+    let config = json!({
+        "endpoints": [
+            {"id": "solo", "protocol": "anthropic_messages",
+             "base_url": format!("http://127.0.0.1:{upstream_port}"), "models": ["model-solo"]}
+        ],
+        "routes": {"main": {"endpoint": "solo", "model": "model-solo"}}
+    });
+    let path = write_config("config-main-only", &config);
+    start_router(port, path.clone()).await;
+    let client = reqwest::Client::new();
+
+    let body = json!({
+        "model": "rayline-router", "stream": true, "max_tokens": 16,
+        "messages": [{"role": "user", "content": "hi"}]
+    });
+
+    let main_resp = client
+        .post(format!("http://127.0.0.1:{port}/v1/messages"))
+        .header("anthropic-version", "2023-06-01")
+        .json(&body)
+        .send()
+        .await
+        .expect("main request");
+    assert_eq!(main_resp.status(), 200);
+    assert_eq!(header(&main_resp, "x-rayline-task-class"), Some("main"));
+    assert_eq!(
+        header(&main_resp, "x-rayline-selected-model"),
+        Some("model-solo")
+    );
+    assert_eq!(sse_text(&collect_sse(main_resp).await), "ONE-MODEL-OK");
+
+    let sub_resp = client
+        .post(format!("http://127.0.0.1:{port}/v1/messages"))
+        .header("anthropic-version", "2023-06-01")
+        .header("x-claude-code-agent-id", "abc123")
+        .header("x-rayline-claude-code-agent-type", "reviewer")
+        .json(&body)
+        .send()
+        .await
+        .expect("subagent request");
+    assert_eq!(sub_resp.status(), 200);
+    assert_eq!(header(&sub_resp, "x-rayline-task-class"), Some("subagent"));
+    assert_eq!(
+        header(&sub_resp, "x-rayline-selected-model"),
+        Some("model-solo")
+    );
+    assert_eq!(sse_text(&collect_sse(sub_resp).await), "ONE-MODEL-OK");
+
+    let _ = std::fs::remove_file(path);
+    println!("PASS main-only config drives main AND subagents to the single endpoint");
+}
+
+/// Codex namespaces MCP tools with characters (`.`, `/`) that Anthropic's
+/// Messages API and the providers behind it reject: forwarding them verbatim
+/// fails the whole turn with a 400 the client shows as "Provider returned
+/// error". The router must rewrite such names to the provider-safe charset on
+/// the way upstream and restore the client's original name on the way back, so
+/// Codex can still match the call to the MCP tool it declared.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_style_tool_names_are_provider_safe_upstream_and_restored_downstream() {
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let up_port = upstream.local_addr().unwrap().port();
+    // The upstream answers with the name it was given (the rewritten one), the
+    // way a real provider echoes the tool it picked.
+    let sse = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5}}}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"codex_list_resource_templates\"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"cursor\\\":null}\"}}\n\n",
+        "event: content_block_stop\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "event: message_delta\n",
+        "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":2}}\n\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n\n",
+    );
+    let (tx, rx) = oneshot::channel();
+    tokio::spawn(serve_once_capture(upstream, http_sse(sse), tx));
+
+    let port = free_port();
+    let config = json!({
+        "endpoints": [{
+            "id": "mock-anthropic",
+            "protocol": "anthropic_messages",
+            "base_url": format!("http://127.0.0.1:{up_port}"),
+            "models": ["model-solo"]
+        }],
+        "routes": {
+            "main": {"endpoint": "mock-anthropic", "model": "model-solo"},
+            "model_routes": {
+                "rayline-local": {"endpoint": "mock-anthropic", "model": "model-solo"}
+            }
+        }
+    });
+    let path = write_config("mcp-tool-names", &config);
+    start_router(port, path.clone()).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{port}/v1/responses"))
+        .json(&json!({
+            "model": "rayline-local",
+            "stream": true,
+            "input": [{"type": "message", "role": "user", "content": [
+                {"type": "input_text", "text": "list the templates"}
+            ]}],
+            "tools": [{
+                "type": "function",
+                "name": "codex.list_resource_templates",
+                "description": "List MCP resource templates",
+                "parameters": {"type": "object", "properties": {}}
+            }]
+        }))
+        .send()
+        .await
+        .expect("router request");
+    assert_eq!(resp.status(), 200);
+
+    let events = collect_sse(resp).await;
+    let call = events
+        .iter()
+        .find(|e| e["type"] == "response.output_item.done" && e["item"]["type"] == "function_call")
+        .expect("a function_call item");
+    assert_eq!(call["item"]["name"], "codex.list_resource_templates");
+    assert_eq!(call["item"]["call_id"], "toolu_1");
+    assert_eq!(call["item"]["arguments"], "{\"cursor\":null}");
+
+    let captured = rx.await.expect("captured upstream request");
+    let body = captured
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body)
+        .unwrap_or_default();
+    let sent = serde_json::from_str::<Value>(body).expect("upstream request body");
+    let sent_name = sent["tools"][0]["name"]
+        .as_str()
+        .expect("upstream tool name");
+    assert_eq!(sent_name, "codex_list_resource_templates");
+    assert!(
+        !captured.contains("codex.list_resource_templates"),
+        "the provider-rejected name must not reach upstream"
+    );
+
+    let _ = std::fs::remove_file(path);
+    println!("PASS MCP tool name rewritten upstream as {sent_name:?} and restored downstream");
+}
