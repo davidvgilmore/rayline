@@ -105,6 +105,11 @@ pub struct RunRequest {
     /// plane; the proxy scope is derived from `routes.main` (passthrough sentinel
     /// → subagents-only, else route-all). Distinct from `router_config_path`.
     pub config_path: Option<PathBuf>,
+    /// Experimental local model-routing policy. C82 is deliberately explicit
+    /// and cannot be combined with static/local/model overrides.
+    pub orchestrator: Option<String>,
+    pub router_device: String,
+    pub router_memory_budget_gib: Option<String>,
     pub root_env_explicit: bool,
 }
 
@@ -550,7 +555,9 @@ async fn run_command_from_home(
     } else {
         None
     };
-    let local_plane = request.local_router || config_engages_local;
+    let local_plane = request.local_router
+        || config_engages_local
+        || request.orchestrator.as_deref() == Some("c82");
 
     if config_engages_local {
         if let Some(path) = effective_config.as_deref() {
@@ -619,7 +626,24 @@ async fn run_command_from_home(
         request.isolated,
         local_cfg.as_ref(),
     );
-    let local_start_request = if config_engages_local {
+    let local_start_request = if request.orchestrator.as_deref() == Some("c82") {
+        let mut start_request =
+            crate::router::RouterStartRequest::local_router_defaults(request.root_env_explicit);
+        start_request.env_name = Some(env_name.clone());
+        start_request.injector_port = resolve_injector_port(request.local_injector_port)?;
+        start_request.no_local_model = true;
+        start_request.local_model_id = "rayline/router".to_owned();
+        start_request.c82 = Some(
+            crate::c82::start_config(
+                home,
+                &request.router_device,
+                request.router_memory_budget_gib.as_deref(),
+            )
+            .await
+            .map_err(|error| RunError::Router(error.to_string()))?,
+        );
+        Some(start_request)
+    } else if config_engages_local {
         // Config-driven (no `--local`): build a local-router start request straight
         // from the `--config` file. The local router reads `endpoints` + `routes`
         // (incl. per-subagent-type) directly; we only resolve the key and decide
@@ -1128,7 +1152,12 @@ async fn start_local_router(
     home: &Path,
     start_request: &crate::router::RouterStartRequest,
 ) -> Result<(), RunError> {
-    if start_request.no_local_model {
+    if start_request.c82.is_some() {
+        eprintln!(
+            "Starting C82 on-device orchestrator (the first encoder load can take a minute).\nRouter progress: tail -f {}",
+            crate::router::local_router_log_path(home).display()
+        );
+    } else if start_request.no_local_model {
         eprintln!(
             "Starting router (config-driven; no on-device model).\nRouter progress: tail -f {}",
             crate::router::local_router_log_path(home).display()
@@ -1221,6 +1250,10 @@ async fn configure_proxy_env(
                     diagnose: request.diagnose,
                     upstream_ca_path: request.upstream_ca_path.clone(),
                     isolated: true,
+                    episode_prefix: start_request
+                        .c82
+                        .as_ref()
+                        .map(|c82| c82.episode_prefix.clone()),
                 },
             )
             .await

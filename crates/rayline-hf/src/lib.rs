@@ -13,6 +13,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
+const HF_TOKEN_ENV_VARS: [&str; 4] = [
+    "HF_TOKEN",
+    "HF_API_TOKEN",
+    "HUGGINGFACE_HUB_TOKEN",
+    "HUGGING_FACE_HUB_TOKEN",
+];
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -315,9 +322,11 @@ pub fn hf_api_get_commit(repo: &str) -> Result<String, String> {
         .build()
         .map_err(|e| format!("Failed to create HTTP client: {e}"))?;
 
-    let response = client
-        .get(&url)
-        .header("User-Agent", "rayline")
+    let mut request = client.get(&url).header("User-Agent", "rayline");
+    if let Some(token) = hf_token() {
+        request = request.bearer_auth(token);
+    }
+    let response = request
         .send()
         .map_err(|e| format!("HF API request failed: {e}"))?;
 
@@ -865,10 +874,18 @@ fn download_file_to_path(
         fs::create_dir_all(parent).map_err(|e| format!("Failed to create directory: {e}"))?;
     }
 
-    let client = reqwest::blocking::Client::builder()
+    let mut client_builder = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(3600))
         .connect_timeout(Duration::from_secs(30))
-        .tcp_keepalive(Duration::from_secs(30))
+        .tcp_keepalive(Duration::from_secs(30));
+    if let Some(token) = hf_token() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        let value = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+            .map_err(|_| "Hugging Face token contains invalid header characters".to_string())?;
+        headers.insert(reqwest::header::AUTHORIZATION, value);
+        client_builder = client_builder.default_headers(headers);
+    }
+    let client = client_builder
         .build()
         .map_err(|e| format!("Failed to create HTTP client: {e}"))?;
 
@@ -923,6 +940,19 @@ fn download_file_to_path(
             }
         }
     }
+}
+
+/// Resolve an inherited Hugging Face token without reading shell profiles or
+/// persisting the value. Empty variables are ignored.
+pub fn hf_token() -> Option<String> {
+    hf_token_from(|name| std::env::var(name).ok())
+}
+
+fn hf_token_from(mut read: impl FnMut(&str) -> Option<String>) -> Option<String> {
+    HF_TOKEN_ENV_VARS
+        .iter()
+        .filter_map(|name| read(name))
+        .find(|value| !value.trim().is_empty())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1123,6 +1153,20 @@ mod tests {
             repo_to_folder_name("unsloth/Qwen3.5-2B-GGUF"),
             "models--unsloth--Qwen3.5-2B-GGUF"
         );
+    }
+
+    #[test]
+    fn hf_token_resolution_supports_documented_variables_and_precedence() {
+        let values = std::collections::HashMap::from([
+            ("HF_TOKEN", "".to_owned()),
+            ("HF_API_TOKEN", "api-token".to_owned()),
+            ("HUGGINGFACE_HUB_TOKEN", "hub-token".to_owned()),
+        ]);
+        assert_eq!(
+            hf_token_from(|name| values.get(name).cloned()),
+            Some("api-token".to_owned())
+        );
+        assert_eq!(hf_token_from(|_| None), None);
     }
 
     #[test]

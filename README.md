@@ -118,6 +118,29 @@ only ever need `--local`** — the other two are advanced overrides.
 The [Getting Started guide](docs/getting-started.md#choosing-where-requests-go)
 has the full matrix and every valid combination.
 
+### Experimental C82 orchestrator
+
+C82 is an experimental seven-model policy whose frozen Qwen encoder runs on
+the user's GPU through a manifest-pinned, unmodified upstream libllama build.
+The normal path contains no Python, PyTorch, or `uv` environment. It currently
+targets Apple Silicon Metal and NVIDIA CUDA, dispatches selected workers
+through OpenRouter, and is not a production-promotion claim.
+
+Inherit `HF_TOKEN` (or `HF_API_TOKEN`) for the private immutable artifact and
+`OPENROUTER_API_KEY` for worker calls, then choose the routing scope explicitly:
+
+```bash
+rayline orchestrator doctor c82
+rayline claude --orchestrator c82 --route all
+rayline claude --orchestrator c82 --route subagents
+rayline router start --mode anthropic --orchestrator c82 --route all
+```
+
+Use `--router-device auto|mps|cuda|cpu` and optionally
+`--router-memory-budget <GiB>`. `doctor` verifies artifact hashes, the pinned
+libllama revision and active accelerator, all frozen parity cases, and exact
+incremental-versus-clean cache equivalence.
+
 ## Use Rayline From Code or Agents
 
 You can also send your own Anthropic API traffic through Rayline — from a script
