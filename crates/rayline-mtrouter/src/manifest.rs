@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-pub const MANIFEST_SCHEMA: &str = "rayline.mtrouter-runtime.v2";
+pub const MANIFEST_SCHEMA: &str = "rayline.mtrouter-runtime.v3";
 pub const ENCODER_MODEL: &str = "Qwen/Qwen3.5-0.8B";
 pub const ENCODER_REVISION: &str = "2fc06364715b967f1860aea9cf38778875588b17";
 pub const LLAMA_CPP_REVISION: &str = "8c5d694fe7e28e8973349b634a72fe7683ecc940";
@@ -56,6 +56,7 @@ pub struct SourceCheckpoint {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct EncoderManifest {
     pub model: String,
     pub revision: String,
@@ -73,18 +74,8 @@ pub struct EncoderManifest {
     pub kv_session_budget_tokens: usize,
     pub kv_process_budget_tokens: usize,
     pub kv_idle_ttl_seconds: f64,
-    pub sidecar: SidecarManifest,
     pub golden: Option<EncoderGoldenManifest>,
-    #[serde(default)]
-    pub native: Option<NativeEncoderManifest>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct SidecarManifest {
-    pub wheel: String,
-    pub wheel_sha256: String,
-    pub dependency_lock: String,
-    pub dependency_lock_sha256: String,
+    pub native: NativeEncoderManifest,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -237,28 +228,28 @@ impl Manifest {
                 "C82 encoder contract does not match the validated runtime"
             ));
         }
-        if let Some(native) = self.encoder.native.as_ref()
-            && (native.runtime != "llama_cpp_native"
-                || native.llama_cpp_repository != "davidvgilmore/llama.cpp"
-                || native.llama_cpp_revision != LLAMA_CPP_REVISION
-                || native.llama_cpp_tag != "b10153+rayline-cumulative-mean"
-                || native.pooling_implementation != "libllama_fp32_cumulative_mean"
-                || native.flash_attention
-                || native.physical_batch_tokens != 512
-                || native.max_sessions != 2
-                || native.kv_cache_type != "BF16"
-                || native.kv_unified
-                || native.swa_full
-                || native.cuda_nccl
-                || native.gguf_conversion_command.is_empty()
-                || native.gguf.file.is_empty()
-                || native.binaries.is_empty()
-                || native.binaries.iter().any(|binary| {
-                    binary.target.is_empty()
-                        || binary.accelerator.is_empty()
-                        || binary.file.is_empty()
-                        || binary.sha256.is_empty()
-                }))
+        let native = &self.encoder.native;
+        if native.runtime != "llama_cpp_native"
+            || native.llama_cpp_repository != "davidvgilmore/llama.cpp"
+            || native.llama_cpp_revision != LLAMA_CPP_REVISION
+            || native.llama_cpp_tag != "b10153+rayline-cumulative-mean"
+            || native.pooling_implementation != "libllama_fp32_cumulative_mean"
+            || native.flash_attention
+            || native.physical_batch_tokens != 512
+            || native.max_sessions != 2
+            || native.kv_cache_type != "BF16"
+            || native.kv_unified
+            || native.swa_full
+            || native.cuda_nccl
+            || native.gguf_conversion_command.is_empty()
+            || native.gguf.file.is_empty()
+            || native.binaries.is_empty()
+            || native.binaries.iter().any(|binary| {
+                binary.target.is_empty()
+                    || binary.accelerator.is_empty()
+                    || binary.file.is_empty()
+                    || binary.sha256.is_empty()
+            })
         {
             return Err(anyhow!("C82 native encoder contract is incompatible"));
         }
@@ -318,26 +309,6 @@ impl Manifest {
         Ok(())
     }
 
-    pub fn verify_runtime_files(&self, runtime_dir: &Path) -> Result<()> {
-        self.verify_core_files(runtime_dir)?;
-        for (relative, expected, label) in [
-            (
-                self.encoder.sidecar.wheel.as_str(),
-                self.encoder.sidecar.wheel_sha256.as_str(),
-                "sidecar wheel",
-            ),
-            (
-                self.encoder.sidecar.dependency_lock.as_str(),
-                self.encoder.sidecar.dependency_lock_sha256.as_str(),
-                "sidecar dependency lock",
-            ),
-        ] {
-            verify_file_hash(&runtime_dir.join(relative), expected)
-                .with_context(|| format!("verify C82 {label}"))?;
-        }
-        Ok(())
-    }
-
     pub fn verify_core_files(&self, runtime_dir: &Path) -> Result<()> {
         for (relative, expected, label) in [
             (
@@ -366,11 +337,7 @@ impl Manifest {
         runtime_dir: &Path,
         binary: &NativeBinaryManifest,
     ) -> Result<()> {
-        let native = self
-            .encoder
-            .native
-            .as_ref()
-            .ok_or_else(|| anyhow!("C82 manifest has no native encoder contract"))?;
+        let native = &self.encoder.native;
         verify_file_hash(&runtime_dir.join(&native.gguf.file), &native.gguf.sha256)
             .context("verify C82 native GGUF")?;
         verify_file_hash(&runtime_dir.join(&binary.file), &binary.sha256)

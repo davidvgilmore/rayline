@@ -235,8 +235,8 @@ rayline claude --orchestrator c82 --route subagents
 ```
 
 The routing scope is mandatory. C82 cannot be combined with `--local`,
-`--config`, `--model`, or `--via env`. The normal installation invokes a
-hash-pinned native libllama binary and BF16 GGUF—never Python or PyTorch.
+`--config`, `--model`, or `--via env`. The installation invokes a hash-pinned
+native libllama binary and BF16 GGUF.
 `--router-device` accepts `auto`, `mps`, `cuda`, or `cpu`; use
 `--router-memory-budget <GiB>` to impose a stricter readiness ceiling.
 

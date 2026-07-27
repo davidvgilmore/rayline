@@ -10,7 +10,7 @@ pub const REPO: &str = "rayline-ai/mtrouter-c82";
 pub const COMMIT: &str = rayline_local_router::C82_ARTIFACT_COMMIT;
 pub const MANIFEST_FILE: &str = "runtime/manifest.json";
 pub const MANIFEST_SHA256: &str =
-    "3bd1935524380f3671f90ec25708e68fd277bcf024610f679a29c19f7999fe72";
+    "05e1a23105ec9d537d6cc5b1da7a06b01c7536b6c773d119d967d397bb95e043";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StartConfig {
@@ -82,11 +82,7 @@ fn provision_blocking(_home: &Path) -> io::Result<Provisioned> {
         .ok_or_else(|| io::Error::other("C82 manifest has no runtime directory"))?
         .to_path_buf();
     let manifest = Manifest::load(&manifest_path).map_err(io::Error::other)?;
-    let native = manifest
-        .encoder
-        .native
-        .as_ref()
-        .ok_or_else(|| io::Error::other("C82 artifact has no native libllama runtime"))?;
+    let native = &manifest.encoder.native;
     let binary = platform_binary(&native.binaries)?;
 
     for (file, hash, stage) in [
@@ -251,12 +247,7 @@ pub async fn doctor(request: &DoctorRequest) -> io::Result<String> {
         .verify_encoder_golden()
         .await
         .map_err(io::Error::other)?;
-    let native = provisioned
-        .manifest
-        .encoder
-        .native
-        .as_ref()
-        .ok_or_else(|| io::Error::other("C82 native manifest disappeared"))?;
+    let native = &provisioned.manifest.encoder.native;
     let binary = platform_binary(&native.binaries)?;
     rayline_mtrouter::verify_file_hash(&provisioned.native_binary, &binary.sha256)
         .map_err(io::Error::other)?;
@@ -264,7 +255,6 @@ pub async fn doctor(request: &DoctorRequest) -> io::Result<String> {
         "status": "ready",
         "orchestrator": "c82",
         "runtime": "llama_cpp_native",
-        "python_used": health.python_used,
         "artifact": {
             "repo": REPO,
             "commit": COMMIT,

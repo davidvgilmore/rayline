@@ -17,12 +17,12 @@ upstream gap and remains PR-ready for later submission.
 
 Flash attention is deliberately disabled. Both `b9585` and the current
 `b10153` Metal backend returned a first non-finite token embedding at token
-31,936 for the frozen repeated-token probe, while the PyTorch BF16 reference
-and upstream non-flash libllama path remained finite. The manifest and health
-response pin this choice so an upstream upgrade cannot silently re-enable the
-failing path. A 512-token physical micro-batch also avoids the upstream Metal
-page fault observed at the 262,144-token boundary with a 2,048-token
-micro-batch; the logical incremental checkpoint grid remains 8,192 tokens.
+31,936 for the frozen repeated-token probe, while the upstream non-flash
+libllama path remained finite. The manifest and health response pin this choice
+so an upstream upgrade cannot silently re-enable the failing path. A 512-token
+physical micro-batch also avoids the upstream Metal page fault observed at the
+262,144-token boundary with a 2,048-token micro-batch; the logical incremental
+checkpoint grid remains 8,192 tokens.
 CUDA builds also disable NCCL: C82 owns one user GPU, so a collective
 communication dependency would add no value and would make the portable helper
 require a separately installed `libnccl`.

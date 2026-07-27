@@ -36,7 +36,7 @@ async fn native_runtime_cache_contract() -> Result<()> {
     }
     let router = C82Router::load_native(runtime, options).await?;
     let health = router.health().await?;
-    anyhow::ensure!(health.backend == "libllama" && !health.python_used);
+    anyhow::ensure!(health.backend == "libllama");
     if std::env::var_os("RAYLINE_C82_NATIVE_LONG_ONLY").is_some() {
         return run_truncation_contract(&router).await;
     }

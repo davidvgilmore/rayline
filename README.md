@@ -120,29 +120,45 @@ has the full matrix and every valid combination.
 
 ### Experimental C82 orchestrator
 
-C82 is an experimental seven-model policy whose frozen Qwen encoder runs on
-the user's GPU through a manifest-pinned libllama build. The pinned
-`davidvgilmore/llama.cpp` branch is a minimal fork of upstream `b10153` that
-adds exact cumulative FP32 mean pooling and opaque checkpoint APIs required by
-incremental C82 inference.
-The normal path contains no Python, PyTorch, or `uv` environment. It currently
-targets Apple Silicon Metal and NVIDIA CUDA, dispatches selected workers
-through OpenRouter, and is not a production-promotion claim.
+C82 is an experimental orchestrator that chooses among seven OpenRouter models
+on every agent turn. Its small routing encoder runs on your GPU through native
+libllama; the selected model call uses your OpenRouter account.
 
-Inherit `HF_TOKEN` (or `HF_API_TOKEN`) for the private immutable artifact and
-`OPENROUTER_API_KEY` for worker calls, then choose the routing scope explicitly:
+The C82 weights are not publicly downloadable yet. Before using it, your
+Hugging Face account must have read access to the private
+[`rayline-ai/mtrouter-c82`](https://huggingface.co/rayline-ai/mtrouter-c82)
+repo. Create a read token for that account and expose it, along with your
+OpenRouter key, to the Rayline process:
 
 ```bash
+export HF_TOKEN="hf_..."
+export OPENROUTER_API_KEY="sk-or-..."
+
 rayline orchestrator doctor c82
-rayline claude --orchestrator c82 --route all
-rayline claude --orchestrator c82 --route subagents
-rayline router start --mode anthropic --orchestrator c82 --route all
 ```
 
-Use `--router-device auto|mps|cuda|cpu` and optionally
-`--router-memory-budget <GiB>`. `doctor` verifies artifact hashes, the pinned
-libllama revision and active accelerator, all frozen parity cases, and exact
-incremental-versus-clean cache equivalence.
+`doctor` downloads the immutable C82 bundle on first use, verifies every
+artifact hash, and confirms that the native encoder is active on Metal or CUDA.
+Then launch Claude Code with one explicit routing scope:
+
+```bash
+# Let C82 choose the model for every Claude Code turn.
+rayline claude --orchestrator c82 --route all
+
+# Keep the main Claude session unchanged; use C82 for subagents only.
+rayline claude --orchestrator c82 --route subagents
+```
+
+That is the complete setup: Rayline provisions and owns the local router
+lifecycle. It never stores either key. `--route subagents` uses your normal
+Claude login for the main agent. For diagnostics or constrained machines, add
+`--router-device auto|mps|cuda|cpu` or `--router-memory-budget <GiB>` to either
+command.
+
+C82 currently targets Apple Silicon Metal and NVIDIA CUDA. The private bundle
+pins the BF16 GGUF, Metal and CUDA helpers, libllama revision, policy weights,
+provider order, retry behavior, and pricing snapshot. It is an experimental
+serving path, not a production-promotion claim.
 
 ## Use Rayline From Code or Agents
 

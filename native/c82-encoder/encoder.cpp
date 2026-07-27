@@ -281,12 +281,12 @@ native_encoder::native_encoder(native_encoder_options options)
     context_params.n_threads_batch = context_params.n_threads;
     // Rayline's pinned libllama fork retains an exact FP32 sum/count across
     // decode calls. The opaque pooling state is checkpointed with recurrent
-    // model memory below so incremental episodes preserve the PyTorch contract.
+    // model memory below so incremental episodes preserve the frozen contract.
     context_params.pooling_type = LLAMA_POOLING_TYPE_MEAN_CUMULATIVE;
     context_params.attention_type = LLAMA_ATTENTION_TYPE_CAUSAL;
-    // The reference uses PyTorch SDPA. Upstream Metal flash attention becomes
-    // non-finite on the frozen repeated-token probe at token 31,936; keep the
-    // upstream non-flash graph until an upgraded pin passes the same probe.
+    // Upstream Metal flash attention becomes non-finite on the frozen
+    // repeated-token probe at token 31,936; keep the upstream non-flash graph
+    // until an upgraded pin passes the same probe.
     context_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
     context_params.embeddings = true;
     context_params.offload_kqv = resolved_device_ != "cpu";
@@ -376,8 +376,6 @@ json native_encoder::health() {
         {"backend_revision", RAYLINE_LLAMA_COMMIT},
         {"device", resolved_device_},
         {"backend_active", selected_device_compute_nodes_ > 0},
-        {"python_used", false},
-        {"torch_version", "not-used"},
         {"bf16_supported", true},
         {"mixed_device_fallback",
             resolved_device_ != "cpu" && other_device_compute_nodes_ > 0},

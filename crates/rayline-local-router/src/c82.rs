@@ -532,9 +532,9 @@ fn anthropic_messages_to_turns(request: &Value) -> Result<Vec<HistoryTurn>> {
                             tool_names.insert(id, name.clone());
                             let arguments = block.get("input").unwrap_or(&Value::Null);
                             let rendered = if arguments.is_object() {
-                                python_json(arguments)
+                                compact_json(arguments)
                             } else {
-                                python_string_coerce(arguments)
+                                string_coerce(arguments)
                             };
                             parts.push(format!("[tool_call {name}] {rendered}"));
                         }
@@ -617,7 +617,7 @@ fn anthropic_messages_to_turns(request: &Value) -> Result<Vec<HistoryTurn>> {
     Ok(turns)
 }
 
-fn python_string_coerce(value: &Value) -> String {
+fn string_coerce(value: &Value) -> String {
     match value {
         Value::Null => String::new(),
         Value::Bool(value) => {
@@ -632,7 +632,7 @@ fn python_string_coerce(value: &Value) -> String {
     }
 }
 
-fn python_json(value: &Value) -> String {
+fn compact_json(value: &Value) -> String {
     match value {
         Value::Null => "null".to_owned(),
         Value::Bool(value) => value.to_string(),
@@ -642,7 +642,7 @@ fn python_json(value: &Value) -> String {
             "[{}]",
             values
                 .iter()
-                .map(python_json)
+                .map(compact_json)
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
@@ -656,7 +656,7 @@ fn python_json(value: &Value) -> String {
                     .map(|(key, value)| format!(
                         "{}: {}",
                         ascii_json_string(key),
-                        python_json(value)
+                        compact_json(value)
                     ))
                     .collect::<Vec<_>>()
                     .join(", ")
@@ -855,7 +855,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tool_rendering_matches_python_json_spacing_and_ascii() {
+    fn tool_rendering_matches_compact_json_spacing_and_ascii() {
         let request = json!({
             "messages": [
                 {"role":"assistant","content":[

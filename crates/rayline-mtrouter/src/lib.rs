@@ -2,8 +2,7 @@
 //!
 //! The GPU-resident frozen Qwen encoder lives in a pinned native libllama
 //! process. This crate verifies the immutable runtime bundle, runs the
-//! seven-arm switch-aware head on CPU, and owns cache-aware hysteresis. The
-//! HTTP client remains available only for the opt-in PyTorch reference oracle.
+//! seven-arm switch-aware head on CPU, and owns cache-aware hysteresis.
 
 mod manifest;
 mod model;
@@ -18,10 +17,9 @@ pub use native::NativeEncoderOptions;
 pub use policy::{Decision, EpisodeState, WorkerWarmth, argmax_first};
 
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow};
-use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -41,11 +39,8 @@ pub struct EncoderHealth {
     #[serde(default)]
     pub backend_revision: String,
     pub device: String,
-    pub torch_version: String,
     pub bf16_supported: bool,
     pub mixed_device_fallback: bool,
-    #[serde(default)]
-    pub python_used: bool,
     #[serde(default)]
     pub backend_active: bool,
     pub encoder_model: String,
@@ -131,51 +126,10 @@ pub struct C82Router {
     runtime_dir: std::path::PathBuf,
     manifest: Manifest,
     estimator: Estimator,
-    encoder: EncoderBackend,
-}
-
-#[derive(Clone)]
-enum EncoderBackend {
-    PytorchReference {
-        encoder_url: String,
-        encoder_token: String,
-        http: Client,
-    },
-    Native(native::NativeEncoderClient),
+    encoder: native::NativeEncoderClient,
 }
 
 impl C82Router {
-    /// Load the opt-in PyTorch reference oracle over authenticated loopback
-    /// HTTP. Normal C82 launches use [`Self::load_native`].
-    pub fn load(
-        runtime_dir: impl AsRef<Path>,
-        encoder_url: impl Into<String>,
-        encoder_token: impl Into<String>,
-    ) -> Result<Self> {
-        let runtime_dir = runtime_dir.as_ref();
-        let manifest_path = runtime_dir.join("manifest.json");
-        let manifest = Manifest::load(&manifest_path)?;
-        manifest.verify_runtime_files(runtime_dir)?;
-        let estimator = Estimator::load(runtime_dir, &manifest)?;
-        let encoder_token = encoder_token.into();
-        if encoder_token.is_empty() {
-            return Err(anyhow!("C82 encoder IPC token cannot be empty"));
-        }
-        Ok(Self {
-            runtime_dir: runtime_dir.to_path_buf(),
-            manifest,
-            estimator,
-            encoder: EncoderBackend::PytorchReference {
-                encoder_url: encoder_url.into().trim_end_matches('/').to_owned(),
-                encoder_token,
-                http: Client::builder()
-                    .connect_timeout(Duration::from_secs(5))
-                    .timeout(Duration::from_secs(600))
-                    .build()?,
-            },
-        })
-    }
-
     pub async fn load_native(
         runtime_dir: impl AsRef<Path>,
         options: NativeEncoderOptions,
@@ -187,22 +141,12 @@ impl C82Router {
         let binary = manifest
             .encoder
             .native
-            .as_ref()
-            .ok_or_else(|| anyhow!("C82 artifact has no native encoder contract"))?
             .binaries
             .iter()
             .find(|binary| runtime_dir.join(&binary.file) == options.binary_path)
             .ok_or_else(|| anyhow!("C82 native binary is not declared by the manifest"))?;
         manifest.verify_native_files(runtime_dir, binary)?;
-        let expected_model = runtime_dir.join(
-            &manifest
-                .encoder
-                .native
-                .as_ref()
-                .ok_or_else(|| anyhow!("C82 artifact has no native encoder contract"))?
-                .gguf
-                .file,
-        );
+        let expected_model = runtime_dir.join(&manifest.encoder.native.gguf.file);
         if options.model_path != expected_model {
             return Err(anyhow!("C82 native GGUF is not the manifest-pinned file"));
         }
@@ -212,7 +156,7 @@ impl C82Router {
             runtime_dir: runtime_dir.to_path_buf(),
             manifest,
             estimator,
-            encoder: EncoderBackend::Native(encoder),
+            encoder,
         })
     }
 
@@ -397,27 +341,12 @@ impl C82Router {
     }
 
     pub async fn health(&self) -> Result<EncoderHealth> {
-        let health: EncoderHealth = match &self.encoder {
-            EncoderBackend::PytorchReference {
-                encoder_url,
-                encoder_token,
-                http,
-            } => {
-                let response = http
-                    .get(format!("{encoder_url}/health"))
-                    .bearer_auth(encoder_token)
-                    .send()
-                    .await
-                    .context("call C82 PyTorch encoder /health")?
-                    .error_for_status()
-                    .context("C82 PyTorch encoder /health failed")?;
-                response.json().await?
-            }
-            EncoderBackend::Native(encoder) => {
-                serde_json::from_value(encoder.call(serde_json::json!({"op": "health"})).await?)
-                    .context("parse C82 native encoder health")?
-            }
-        };
+        let health: EncoderHealth = serde_json::from_value(
+            self.encoder
+                .call(serde_json::json!({"op": "health"}))
+                .await?,
+        )
+        .context("parse C82 native encoder health")?;
         if health.status != "ready"
             || health.mixed_device_fallback
             || !health.bf16_supported
@@ -433,32 +362,24 @@ impl C82Router {
                 "C82 encoder health does not match the artifact contract"
             ));
         }
-        if matches!(&self.encoder, EncoderBackend::Native(_)) {
-            let native = self
-                .manifest
-                .encoder
-                .native
-                .as_ref()
-                .ok_or_else(|| anyhow!("C82 artifact has no native encoder contract"))?;
-            if health.backend != "libllama"
-                || health.backend_revision != native.llama_cpp_revision
-                || health.python_used
-                || !health.backend_active
-                || !matches!(health.device.as_str(), "metal" | "cuda" | "cpu")
-                || health.flash_attention != Some(native.flash_attention)
-                || health.physical_batch_tokens != Some(native.physical_batch_tokens)
-                || health.max_sessions != Some(native.max_sessions)
-                || health.kv_cache_type.as_deref() != Some(native.kv_cache_type.as_str())
-                || health.kv_unified != Some(native.kv_unified)
-                || health.swa_full != Some(native.swa_full)
-                || health.cuda_nccl != Some(native.cuda_nccl)
-                || health.selected_device_compute_nodes.unwrap_or_default() == 0
-                || health.other_device_compute_nodes != Some(0)
-            {
-                return Err(anyhow!(
-                    "C82 native encoder did not prove the pinned libllama backend"
-                ));
-            }
+        let native = &self.manifest.encoder.native;
+        if health.backend != "libllama"
+            || health.backend_revision != native.llama_cpp_revision
+            || !health.backend_active
+            || !matches!(health.device.as_str(), "metal" | "cuda" | "cpu")
+            || health.flash_attention != Some(native.flash_attention)
+            || health.physical_batch_tokens != Some(native.physical_batch_tokens)
+            || health.max_sessions != Some(native.max_sessions)
+            || health.kv_cache_type.as_deref() != Some(native.kv_cache_type.as_str())
+            || health.kv_unified != Some(native.kv_unified)
+            || health.swa_full != Some(native.swa_full)
+            || health.cuda_nccl != Some(native.cuda_nccl)
+            || health.selected_device_compute_nodes.unwrap_or_default() == 0
+            || health.other_device_compute_nodes != Some(0)
+        {
+            return Err(anyhow!(
+                "C82 native encoder did not prove the pinned libllama backend"
+            ));
         }
         Ok(health)
     }
@@ -500,34 +421,16 @@ impl C82Router {
         turns: &[HistoryTurn],
     ) -> Result<(EncodeResponse, RoutingTelemetry)> {
         let encode_started = Instant::now();
-        let encoded: EncodeResponse = match &self.encoder {
-            EncoderBackend::PytorchReference {
-                encoder_url,
-                encoder_token,
-                http,
-            } => {
-                let response = http
-                    .post(format!("{encoder_url}/encode"))
-                    .bearer_auth(encoder_token)
-                    .json(&serde_json::json!({"episode_id": episode_id, "turns": turns}))
-                    .send()
-                    .await
-                    .context("call C82 PyTorch encoder /encode")?
-                    .error_for_status()
-                    .context("C82 PyTorch encoder /encode failed")?;
-                response.json().await?
-            }
-            EncoderBackend::Native(encoder) => serde_json::from_value(
-                encoder
-                    .call(serde_json::json!({
-                        "op": "encode",
-                        "episode_id": episode_id,
-                        "turns": turns,
-                    }))
-                    .await?,
-            )
-            .context("parse C82 native encoder response")?,
-        };
+        let encoded: EncodeResponse = serde_json::from_value(
+            self.encoder
+                .call(serde_json::json!({
+                    "op": "encode",
+                    "episode_id": episode_id,
+                    "turns": turns,
+                }))
+                .await?,
+        )
+        .context("parse C82 native encoder response")?;
         if encoded.device.is_empty() || encoded.embedding.len() != self.manifest.encoder.dimension {
             return Err(anyhow!("C82 encoder response is incompatible"));
         }
