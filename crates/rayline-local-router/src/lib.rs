@@ -53,7 +53,7 @@ const CLAUDE_CODE_AGENT_ID_HEADER: &str = "x-claude-code-agent-id";
 const RAYLINE_AGENT_TYPE_HEADER: &str = "x-rayline-claude-code-agent-type";
 const OPENAI_SUBAGENT_HEADER: &str = "x-openai-subagent";
 const OPENAI_CLIENT_REQUEST_ID_HEADER: &str = "x-client-request-id";
-pub const C82_ARTIFACT_COMMIT: &str = "4a0d5ff0f473b89d65f2ec3519ed67490612360b";
+pub const C82_ARTIFACT_COMMIT: &str = "ee96d7529f35a61a7d27796d9393d2ec3efab246";
 
 #[derive(Clone)]
 pub struct C82Options {

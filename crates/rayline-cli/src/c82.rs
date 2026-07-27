@@ -7,10 +7,10 @@ use rand::Rng as _;
 use rayline_mtrouter::{Manifest, NativeBinaryManifest, NativeEncoderOptions};
 
 pub const REPO: &str = "rayline-ai/mtrouter-c82";
-pub const COMMIT: &str = "4a0d5ff0f473b89d65f2ec3519ed67490612360b";
+pub const COMMIT: &str = "ee96d7529f35a61a7d27796d9393d2ec3efab246";
 pub const MANIFEST_FILE: &str = "runtime/manifest.json";
 pub const MANIFEST_SHA256: &str =
-    "af924e2f01048eda543992a08d972e2e07828d9f36e9ef08cf4a31f58fe6d3b3";
+    "4fa03cbcae766ecbeaeb52f712ee1863d6ab64b4bdd172bd5cd027a451c21ade";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StartConfig {
