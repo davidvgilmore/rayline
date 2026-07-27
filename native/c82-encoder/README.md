@@ -1,15 +1,19 @@
 # C82 native encoder
 
-This helper is Rayline’s narrow process boundary around unmodified upstream
-`ggml-org/llama.cpp` tag `b10153`, commit
-`b77d646751d01c0962bc203b6809e9d94f7d50b7`.
+This helper is Rayline’s narrow process boundary around
+`davidvgilmore/llama.cpp` commit
+`8c5d694fe7e28e8973349b634a72fe7683ecc940`, a minimal fork of upstream
+`ggml-org/llama.cpp` tag `b10153` (commit
+`b77d646751d01c0962bc203b6809e9d94f7d50b7`).
 
 It uses libllama’s Qwen3.5 tokenization, recurrent state, token embeddings,
-Metal backend, and CUDA backend. Rayline performs the policy’s exact FP32
-masked sum/count at this boundary because graph-level
-`LLAMA_POOLING_TYPE_MEAN` does not preserve the policy contract for the
-multi-sequence recurrent cache shape. Frozen Metal and CUDA parity gate every
-release of this helper; Rayline carries no llama.cpp fork.
+Metal backend, and CUDA backend. The fork adds cumulative FP32 mean pooling
+and opaque snapshot/restore APIs because upstream graph-level
+`LLAMA_POOLING_TYPE_MEAN` is batch-local and does not preserve the policy
+contract across incremental recurrent decode calls. Rayline checkpoints that
+pooling state beside libllama model memory. Frozen Metal and CUDA parity gate
+every release of this helper. The fork is intentionally limited to this
+upstream gap and remains PR-ready for later submission.
 
 Flash attention is deliberately disabled. Both `b9585` and the current
 `b10153` Metal backend returned a first non-finite token embedding at token

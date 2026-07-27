@@ -7,7 +7,7 @@ endif()
 
 set(
     RAYLINE_PINNED_LLAMA_COMMIT
-    "b77d646751d01c0962bc203b6809e9d94f7d50b7"
+    "8c5d694fe7e28e8973349b634a72fe7683ecc940"
 )
 if(NOT RAYLINE_LLAMA_COMMIT)
     set(RAYLINE_LLAMA_COMMIT "${RAYLINE_PINNED_LLAMA_COMMIT}")
@@ -15,7 +15,7 @@ endif()
 if(NOT RAYLINE_LLAMA_COMMIT STREQUAL RAYLINE_PINNED_LLAMA_COMMIT)
     message(
         FATAL_ERROR
-        "RAYLINE_LLAMA_COMMIT must be the audited upstream commit ${RAYLINE_PINNED_LLAMA_COMMIT}"
+        "RAYLINE_LLAMA_COMMIT must be the audited Rayline fork commit ${RAYLINE_PINNED_LLAMA_COMMIT}"
     )
 endif()
 find_package(Git QUIET)
@@ -29,7 +29,7 @@ if(GIT_FOUND AND EXISTS "${LLAMA_CPP_SOURCE}/.git")
     if(NOT LLAMA_CPP_GIT_RESULT EQUAL 0 OR NOT LLAMA_CPP_HEAD STREQUAL RAYLINE_PINNED_LLAMA_COMMIT)
         message(
             FATAL_ERROR
-            "LLAMA_CPP_SOURCE must be upstream llama.cpp at ${RAYLINE_PINNED_LLAMA_COMMIT}; got ${LLAMA_CPP_HEAD}"
+            "LLAMA_CPP_SOURCE must be the Rayline llama.cpp fork at ${RAYLINE_PINNED_LLAMA_COMMIT}; got ${LLAMA_CPP_HEAD}"
         )
     endif()
 endif()

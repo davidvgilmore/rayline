@@ -59,8 +59,7 @@ private:
     struct session {
         llama_seq_id sequence_id = -1;
         std::vector<llama_token> prefix_ids;
-        std::vector<float> aligned_sum;
-        std::vector<float> total_sum;
+        std::vector<float> last_embedding;
         size_t cached_tokens = 0;
         std::chrono::steady_clock::time_point touched_at;
         std::list<std::string>::iterator lru_position;
@@ -84,12 +83,13 @@ private:
     std::vector<float> decode_range(
         llama_seq_id sequence_id,
         const std::vector<llama_token> & ids,
-        size_t start,
-        std::vector<float> running_sum,
-        size_t * aligned_length,
-        std::vector<float> * aligned_sum);
+        size_t start);
     std::vector<uint8_t> snapshot_sequence(llama_seq_id sequence_id);
+    std::vector<uint8_t> snapshot_pooling(llama_seq_id sequence_id);
     void restore_sequence(
+        llama_seq_id sequence_id,
+        const std::vector<uint8_t> & snapshot);
+    void restore_pooling(
         llama_seq_id sequence_id,
         const std::vector<uint8_t> & snapshot);
     static bool backend_eval_callback(

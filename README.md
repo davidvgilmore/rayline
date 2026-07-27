@@ -121,7 +121,10 @@ has the full matrix and every valid combination.
 ### Experimental C82 orchestrator
 
 C82 is an experimental seven-model policy whose frozen Qwen encoder runs on
-the user's GPU through a manifest-pinned, unmodified upstream libllama build.
+the user's GPU through a manifest-pinned libllama build. The pinned
+`davidvgilmore/llama.cpp` branch is a minimal fork of upstream `b10153` that
+adds exact cumulative FP32 mean pooling and opaque checkpoint APIs required by
+incremental C82 inference.
 The normal path contains no Python, PyTorch, or `uv` environment. It currently
 targets Apple Silicon Metal and NVIDIA CUDA, dispatches selected workers
 through OpenRouter, and is not a production-promotion claim.

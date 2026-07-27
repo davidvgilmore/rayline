@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 pub const MANIFEST_SCHEMA: &str = "rayline.mtrouter-runtime.v2";
 pub const ENCODER_MODEL: &str = "Qwen/Qwen3.5-0.8B";
 pub const ENCODER_REVISION: &str = "2fc06364715b967f1860aea9cf38778875588b17";
-pub const LLAMA_CPP_REVISION: &str = "b77d646751d01c0962bc203b6809e9d94f7d50b7";
+pub const LLAMA_CPP_REVISION: &str = "8c5d694fe7e28e8973349b634a72fe7683ecc940";
 pub const CHECKPOINT_SHA256: &str =
     "c2b0e63216c11f1496b47b22dff9f6c83baa6ef065e205a34897deff7493920f";
 pub const WORKER_ORDER: [&str; 7] = [
@@ -239,10 +239,10 @@ impl Manifest {
         }
         if let Some(native) = self.encoder.native.as_ref()
             && (native.runtime != "llama_cpp_native"
-                || native.llama_cpp_repository != "ggml-org/llama.cpp"
+                || native.llama_cpp_repository != "davidvgilmore/llama.cpp"
                 || native.llama_cpp_revision != LLAMA_CPP_REVISION
-                || native.llama_cpp_tag != "b10153"
-                || native.pooling_implementation != "rayline_fp32_sum_count"
+                || native.llama_cpp_tag != "b10153+rayline-cumulative-mean"
+                || native.pooling_implementation != "libllama_fp32_cumulative_mean"
                 || native.flash_attention
                 || native.physical_batch_tokens != 512
                 || native.max_sessions != 2

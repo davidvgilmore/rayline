@@ -279,10 +279,10 @@ native_encoder::native_encoder(native_encoder_options options)
     context_params.n_threads =
         options_.threads > 0 ? options_.threads : default_threads;
     context_params.n_threads_batch = context_params.n_threads;
-    // libllama's graph-level mean pooling is not shape-safe for recurrent
-    // Qwen with n_seq_max > 1. Extract every token row and accumulate the
-    // contract's FP32 masked mean here instead.
-    context_params.pooling_type = LLAMA_POOLING_TYPE_NONE;
+    // Rayline's pinned libllama fork retains an exact FP32 sum/count across
+    // decode calls. The opaque pooling state is checkpointed with recurrent
+    // model memory below so incremental episodes preserve the PyTorch contract.
+    context_params.pooling_type = LLAMA_POOLING_TYPE_MEAN_CUMULATIVE;
     context_params.attention_type = LLAMA_ATTENTION_TYPE_CAUSAL;
     // The reference uses PyTorch SDPA. Upstream Metal flash attention becomes
     // non-finite on the frozen repeated-token probe at token 31,936; keep the
@@ -524,13 +524,10 @@ native_encoder::encode_result native_encoder::encode_incremental(
     found = sessions_.find(episode_id);
     const bool identical = found != sessions_.end()
         && ids == found->second.prefix_ids
-        && !found->second.total_sum.empty();
+        && !found->second.last_embedding.empty();
     if (identical) {
         auto & value = found->second;
-        std::vector<float> embedding = value.total_sum;
-        for (float & component : embedding) {
-            component /= static_cast<float>(ids.size());
-        }
+        std::vector<float> embedding = value.last_embedding;
         const size_t cached = value.cached_tokens;
         touch(episode_id, value);
         return encode_result{
@@ -553,11 +550,9 @@ native_encoder::encode_result native_encoder::encode_incremental(
 
     llama_seq_id sequence_id = -1;
     size_t start = 0;
-    std::vector<float> running_sum;
     if (prefix_hit) {
         sequence_id = found->second.sequence_id;
         start = found->second.cached_tokens;
-        running_sum = found->second.aligned_sum;
         lru_.erase(found->second.lru_position);
         sessions_.erase(found);
     } else {
@@ -571,31 +566,20 @@ native_encoder::encode_result native_encoder::encode_incremental(
         }
     }
 
-    size_t aligned_length = start;
-    std::vector<float> aligned_sum = running_sum;
-    std::vector<float> total_sum;
+    std::vector<float> embedding;
     try {
-        total_sum = decode_range(
-            sequence_id,
-            ids,
-            start,
-            std::move(running_sum),
-            &aligned_length,
-            &aligned_sum);
+        embedding = decode_range(sequence_id, ids, start);
     } catch (...) {
         clear_sequence(sequence_id);
         release_sequence_id(sequence_id);
         throw;
     }
-    if (aligned_length != target_cached) {
+    if (llama_pooling_seq_get_count(context_.get(), sequence_id)
+        != target_cached) {
         clear_sequence(sequence_id);
         release_sequence_id(sequence_id);
-        throw std::runtime_error("native C82 chunk grid drifted");
-    }
-
-    std::vector<float> embedding = total_sum;
-    for (float & component : embedding) {
-        component /= static_cast<float>(ids.size());
+        throw std::runtime_error(
+            "native C82 cumulative pooling checkpoint drifted");
     }
 
     lru_.push_back(episode_id);
@@ -605,8 +589,7 @@ native_encoder::encode_result native_encoder::encode_incremental(
         session{
             sequence_id,
             ids,
-            std::move(aligned_sum),
-            std::move(total_sum),
+            embedding,
             target_cached,
             std::chrono::steady_clock::now(),
             position,
@@ -624,22 +607,11 @@ std::vector<float> native_encoder::encode_without_session(
     const std::vector<llama_token> & ids) {
     const llama_seq_id scratch_sequence_id = allocate_sequence_id();
     clear_sequence(scratch_sequence_id);
-    size_t aligned_length = 0;
-    std::vector<float> aligned_sum;
     try {
-        auto sum = decode_range(
-            scratch_sequence_id,
-            ids,
-            0,
-            {},
-            &aligned_length,
-            &aligned_sum);
+        auto embedding = decode_range(scratch_sequence_id, ids, 0);
         clear_sequence(scratch_sequence_id);
         release_sequence_id(scratch_sequence_id);
-        for (float & component : sum) {
-            component /= static_cast<float>(ids.size());
-        }
-        return sum;
+        return embedding;
     } catch (...) {
         clear_sequence(scratch_sequence_id);
         release_sequence_id(scratch_sequence_id);
@@ -650,23 +622,19 @@ std::vector<float> native_encoder::encode_without_session(
 std::vector<float> native_encoder::decode_range(
     llama_seq_id sequence_id,
     const std::vector<llama_token> & ids,
-    size_t start,
-    std::vector<float> running_sum,
-    size_t * aligned_length,
-    std::vector<float> * aligned_sum) {
+    size_t start) {
     if (ids.empty() || start > ids.size()) {
         throw std::runtime_error("invalid native C82 decode range");
     }
-    if (running_sum.empty()) {
-        running_sum.assign(embedding_dimension_, 0.0F);
-    }
-    if (running_sum.size() != embedding_dimension_) {
-        throw std::runtime_error("native C82 running sum has the wrong dimension");
+    if (llama_pooling_seq_get_count(context_.get(), sequence_id) != start) {
+        throw std::runtime_error(
+            "native C82 cumulative pooling state does not match decode start");
     }
 
     const size_t target_cached =
         (ids.size() / options_.checkpoint_tokens) * options_.checkpoint_tokens;
     std::vector<uint8_t> tail_snapshot;
+    std::vector<uint8_t> tail_pooling_snapshot;
     bool snapshot_taken = false;
 
     for (size_t chunk_start = start; chunk_start < ids.size();) {
@@ -675,6 +643,7 @@ std::vector<float> native_encoder::decode_range(
             && target_cached > 0
             && target_cached < ids.size()) {
             tail_snapshot = snapshot_sequence(sequence_id);
+            tail_pooling_snapshot = snapshot_pooling(sequence_id);
             snapshot_taken = true;
         }
         const size_t chunk_size = std::min(
@@ -700,38 +669,28 @@ std::vector<float> native_encoder::decode_range(
                 + std::to_string(decode_status)
                 + " at token " + std::to_string(chunk_start));
         }
-        for (size_t token_offset = 0; token_offset < chunk_size; ++token_offset) {
-            const float * embedding = llama_get_embeddings_ith(
-                context_.get(),
-                static_cast<int32_t>(token_offset));
-            if (embedding == nullptr) {
-                throw std::runtime_error(
-                    "native C82 libllama did not return a token embedding");
-            }
-            for (
-                size_t component = 0;
-                component < embedding_dimension_;
-                ++component) {
-                if (!std::isfinite(embedding[component])) {
-                    throw std::runtime_error(
-                        "native C82 libllama produced a non-finite token embedding at token "
-                        + std::to_string(chunk_start + token_offset)
-                        + ", component " + std::to_string(component));
-                }
-                running_sum[component] += embedding[component];
-                if (!std::isfinite(running_sum[component])) {
-                    throw std::runtime_error(
-                        "native C82 FP32 pool became non-finite at token "
-                        + std::to_string(chunk_start + token_offset)
-                        + ", component " + std::to_string(component));
-                }
-            }
-        }
         chunk_start += chunk_size;
-        if (chunk_start <= target_cached
-            && chunk_start % options_.checkpoint_tokens == 0) {
-            *aligned_length = chunk_start;
-            *aligned_sum = running_sum;
+        if (llama_pooling_seq_get_count(context_.get(), sequence_id)
+            != chunk_start) {
+            throw std::runtime_error(
+                "native C82 cumulative pooling token count drifted");
+        }
+    }
+
+    const float * pooled =
+        llama_get_embeddings_seq(context_.get(), sequence_id);
+    if (pooled == nullptr) {
+        throw std::runtime_error(
+            "native C82 libllama did not return a cumulative embedding");
+    }
+    std::vector<float> embedding(
+        pooled,
+        pooled + embedding_dimension_);
+    for (size_t component = 0; component < embedding.size(); ++component) {
+        if (!std::isfinite(embedding[component])) {
+            throw std::runtime_error(
+                "native C82 libllama produced a non-finite cumulative embedding "
+                "at component " + std::to_string(component));
         }
     }
 
@@ -741,10 +700,11 @@ std::vector<float> native_encoder::decode_range(
                 "native C82 tail was decoded without an aligned snapshot");
         }
         restore_sequence(sequence_id, tail_snapshot);
+        restore_pooling(sequence_id, tail_pooling_snapshot);
     } else if (target_cached == 0) {
         clear_sequence(sequence_id);
     }
-    return running_sum;
+    return embedding;
 }
 
 std::vector<uint8_t> native_encoder::snapshot_sequence(
@@ -769,6 +729,27 @@ std::vector<uint8_t> native_encoder::snapshot_sequence(
     return snapshot;
 }
 
+std::vector<uint8_t> native_encoder::snapshot_pooling(
+    llama_seq_id sequence_id) {
+    const size_t size =
+        llama_pooling_seq_get_size(context_.get(), sequence_id);
+    if (size == 0) {
+        throw std::runtime_error(
+            "native C82 could not size a cumulative pooling snapshot");
+    }
+    std::vector<uint8_t> snapshot(size);
+    const size_t written = llama_pooling_seq_get_data(
+        context_.get(),
+        snapshot.data(),
+        snapshot.size(),
+        sequence_id);
+    if (written != snapshot.size()) {
+        throw std::runtime_error(
+            "native C82 could not take a cumulative pooling snapshot");
+    }
+    return snapshot;
+}
+
 void native_encoder::restore_sequence(
     llama_seq_id sequence_id,
     const std::vector<uint8_t> & snapshot) {
@@ -781,6 +762,20 @@ void native_encoder::restore_sequence(
         LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
     if (restored == 0) {
         throw std::runtime_error("native C82 could not restore an on-device snapshot");
+    }
+}
+
+void native_encoder::restore_pooling(
+    llama_seq_id sequence_id,
+    const std::vector<uint8_t> & snapshot) {
+    const size_t restored = llama_pooling_seq_set_data(
+        context_.get(),
+        snapshot.data(),
+        snapshot.size(),
+        sequence_id);
+    if (restored != snapshot.size()) {
+        throw std::runtime_error(
+            "native C82 could not restore a cumulative pooling snapshot");
     }
 }
 
@@ -862,11 +857,13 @@ void native_encoder::release_sequence_id(llama_seq_id sequence_id) {
 }
 
 void native_encoder::clear_sequence(llama_seq_id sequence_id) {
-    if (!llama_memory_seq_rm(
+    const bool memory_cleared = llama_memory_seq_rm(
         llama_get_memory(context_.get()),
         sequence_id,
         -1,
-        -1)) {
+        -1);
+    llama_pooling_seq_rm(context_.get(), sequence_id);
+    if (!memory_cleared) {
         throw std::runtime_error("native C82 could not clear sequence state");
     }
 }
