@@ -20,10 +20,10 @@ struct native_encoder_options {
     std::string device = "auto";
     size_t max_tokens = 262144;
     size_t checkpoint_tokens = 8192;
-    size_t physical_batch_tokens = 2048;
+    size_t physical_batch_tokens = 512;
     size_t session_budget_tokens = 300000;
     size_t process_budget_tokens = 600000;
-    size_t max_sessions = 4;
+    size_t max_sessions = 2;
     double idle_ttl_seconds = 900.0;
     size_t memory_budget_bytes = 0;
     int32_t threads = 0;

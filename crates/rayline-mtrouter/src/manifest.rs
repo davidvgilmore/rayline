@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 pub const MANIFEST_SCHEMA: &str = "rayline.mtrouter-runtime.v2";
 pub const ENCODER_MODEL: &str = "Qwen/Qwen3.5-0.8B";
 pub const ENCODER_REVISION: &str = "2fc06364715b967f1860aea9cf38778875588b17";
-pub const LLAMA_CPP_REVISION: &str = "d73cd076740db9c111d0e58ddd4486904469e75e";
+pub const LLAMA_CPP_REVISION: &str = "b77d646751d01c0962bc203b6809e9d94f7d50b7";
 pub const CHECKPOINT_SHA256: &str =
     "c2b0e63216c11f1496b47b22dff9f6c83baa6ef065e205a34897deff7493920f";
 pub const WORKER_ORDER: [&str; 7] = [
@@ -100,6 +100,12 @@ pub struct NativeEncoderManifest {
     pub llama_cpp_revision: String,
     pub llama_cpp_tag: String,
     pub pooling_implementation: String,
+    pub flash_attention: bool,
+    pub physical_batch_tokens: usize,
+    pub max_sessions: usize,
+    pub kv_cache_type: String,
+    pub kv_unified: bool,
+    pub swa_full: bool,
     pub gguf_conversion_command: String,
     pub gguf: NativeFileManifest,
     pub binaries: Vec<NativeBinaryManifest>,
@@ -234,8 +240,14 @@ impl Manifest {
             && (native.runtime != "llama_cpp_native"
                 || native.llama_cpp_repository != "ggml-org/llama.cpp"
                 || native.llama_cpp_revision != LLAMA_CPP_REVISION
-                || native.llama_cpp_tag != "b9585"
+                || native.llama_cpp_tag != "b10153"
                 || native.pooling_implementation != "rayline_fp32_sum_count"
+                || native.flash_attention
+                || native.physical_batch_tokens != 512
+                || native.max_sessions != 2
+                || native.kv_cache_type != "BF16"
+                || native.kv_unified
+                || native.swa_full
                 || native.gguf_conversion_command.is_empty()
                 || native.gguf.file.is_empty()
                 || native.binaries.is_empty()

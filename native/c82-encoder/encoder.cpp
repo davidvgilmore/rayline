@@ -185,7 +185,6 @@ native_encoder::native_encoder(native_encoder_options options)
         selected_model_devices_ = {device_, nullptr};
         model_params.devices = selected_model_devices_.data();
     }
-    model_params.use_mmap = true;
     model_.reset(llama_model_load_from_file(
         options_.model_path.c_str(),
         model_params));
@@ -234,10 +233,10 @@ native_encoder::native_encoder(native_encoder_options options)
     // contract's FP32 masked mean here instead.
     context_params.pooling_type = LLAMA_POOLING_TYPE_NONE;
     context_params.attention_type = LLAMA_ATTENTION_TYPE_CAUSAL;
-    // The reference uses PyTorch SDPA. libllama's fused attention avoids a
-    // quadratic 262k-context scratch allocation; the frozen parity suite gates
-    // its numerical behavior on each supported accelerator.
-    context_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    // The reference uses PyTorch SDPA. Upstream Metal flash attention becomes
+    // non-finite on the frozen repeated-token probe at token 31,936; keep the
+    // upstream non-flash graph until an upgraded pin passes the same probe.
+    context_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
     context_params.embeddings = true;
     context_params.offload_kqv = resolved_device_ != "cpu";
     context_params.op_offload = resolved_device_ != "cpu";
@@ -319,6 +318,12 @@ json native_encoder::health() {
         {"pooling", "masked_mean"},
         {"serialization", "mtrouter-token-blocks-v2"},
         {"kv_chunk_tokens", options_.checkpoint_tokens},
+        {"flash_attention", false},
+        {"physical_batch_tokens", options_.physical_batch_tokens},
+        {"max_sessions", options_.max_sessions},
+        {"kv_cache_type", "BF16"},
+        {"kv_unified", false},
+        {"swa_full", false},
         {"kv_sessions", sessions_.size()},
         {"kv_resident_tokens", resident_tokens()},
         {"kv_session_budget_tokens", options_.session_budget_tokens},
@@ -614,7 +619,8 @@ std::vector<float> native_encoder::decode_range(
         if (decode_status != 0) {
             throw std::runtime_error(
                 "native C82 libllama decode failed with status "
-                + std::to_string(decode_status));
+                + std::to_string(decode_status)
+                + " at token " + std::to_string(chunk_start));
         }
         for (size_t token_offset = 0; token_offset < chunk_size; ++token_offset) {
             const float * embedding = llama_get_embeddings_ith(
@@ -628,7 +634,19 @@ std::vector<float> native_encoder::decode_range(
                 size_t component = 0;
                 component < embedding_dimension_;
                 ++component) {
+                if (!std::isfinite(embedding[component])) {
+                    throw std::runtime_error(
+                        "native C82 libllama produced a non-finite token embedding at token "
+                        + std::to_string(chunk_start + token_offset)
+                        + ", component " + std::to_string(component));
+                }
                 running_sum[component] += embedding[component];
+                if (!std::isfinite(running_sum[component])) {
+                    throw std::runtime_error(
+                        "native C82 FP32 pool became non-finite at token "
+                        + std::to_string(chunk_start + token_offset)
+                        + ", component " + std::to_string(component));
+                }
             }
         }
         chunk_start += chunk_size;

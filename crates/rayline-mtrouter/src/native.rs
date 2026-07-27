@@ -34,10 +34,10 @@ impl NativeEncoderOptions {
             memory_budget_gib: None,
             max_tokens: 262_144,
             checkpoint_tokens: 8_192,
-            physical_batch_tokens: 2_048,
+            physical_batch_tokens: 512,
             session_budget_tokens: 300_000,
             process_budget_tokens: 600_000,
-            max_sessions: 4,
+            max_sessions: 2,
             idle_ttl_seconds: 900.0,
         }
     }

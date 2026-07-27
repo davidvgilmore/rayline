@@ -24,14 +24,25 @@ async fn native_runtime_cache_contract() -> Result<()> {
     let Some((runtime, binary, gguf, device)) = configured_paths() else {
         return Ok(());
     };
-    let router =
-        C82Router::load_native(runtime, NativeEncoderOptions::c82(binary, gguf, device)).await?;
+    let mut options = NativeEncoderOptions::c82(binary, gguf, device);
+    if std::env::var_os("RAYLINE_C82_NATIVE_LONG_SINGLE_SESSION").is_some() {
+        options.max_sessions = 1;
+    }
+    if let Some(value) = std::env::var_os("RAYLINE_C82_NATIVE_PHYSICAL_BATCH") {
+        options.physical_batch_tokens = value
+            .to_string_lossy()
+            .parse()
+            .context("parse RAYLINE_C82_NATIVE_PHYSICAL_BATCH")?;
+    }
+    let router = C82Router::load_native(runtime, options).await?;
     let health = router.health().await?;
     anyhow::ensure!(health.backend == "libllama" && !health.python_used);
+    if std::env::var_os("RAYLINE_C82_NATIVE_LONG_ONLY").is_some() {
+        return run_truncation_contract(&router).await;
+    }
     let parity = router.verify_encoder_golden().await?;
     anyhow::ensure!(
-        parity.selection_parity == 1.0
-            && parity.incremental_clean_embedding_max_abs == Some(0.0)
+        parity.selection_parity == 1.0 && parity.incremental_clean_embedding_max_abs == Some(0.0)
     );
 
     let long_text = (0..1_200)
@@ -50,20 +61,40 @@ async fn native_runtime_cache_contract() -> Result<()> {
     ];
     let state = EpisodeState::new(7);
     anyhow::ensure!(
-        router.route("cache-contract", &prefill, &state).await?.telemetry.encode_mode == "prefill"
+        router
+            .route("cache-contract", &prefill, &state)
+            .await?
+            .telemetry
+            .encode_mode
+            == "prefill"
     );
     anyhow::ensure!(
-        router.route("cache-contract", &delta, &state).await?.telemetry.encode_mode == "delta"
+        router
+            .route("cache-contract", &delta, &state)
+            .await?
+            .telemetry
+            .encode_mode
+            == "delta"
     );
     anyhow::ensure!(
-        router.route("cache-contract", &delta, &state).await?.telemetry.encode_mode == "cached"
+        router
+            .route("cache-contract", &delta, &state)
+            .await?
+            .telemetry
+            .encode_mode
+            == "cached"
     );
     let rebuilt = vec![
         turn("user", "Use a mismatched deterministic prefix."),
         turn("user", long_text),
     ];
     anyhow::ensure!(
-        router.route("cache-contract", &rebuilt, &state).await?.telemetry.encode_mode == "rebuild"
+        router
+            .route("cache-contract", &rebuilt, &state)
+            .await?
+            .telemetry
+            .encode_mode
+            == "rebuild"
     );
 
     for index in 0..5 {
@@ -74,14 +105,23 @@ async fn native_runtime_cache_contract() -> Result<()> {
     anyhow::ensure!(router.health().await?.kv_evictions > 0);
 
     if std::env::var_os("RAYLINE_C82_NATIVE_LONG_TEST").is_some() {
-        let text = " token".repeat(270_000);
-        let route = router
-            .route("truncation-contract", &[turn("user", text)], &state)
-            .await
-            .context("run 262k native truncation contract")?;
-        anyhow::ensure!(route.telemetry.truncated_tokens > 0);
-        anyhow::ensure!(route.telemetry.encode_mode == "full_truncation_fallback");
+        run_truncation_contract(&router).await?;
     }
+    Ok(())
+}
+
+async fn run_truncation_contract(router: &C82Router) -> Result<()> {
+    let text = " token".repeat(270_000);
+    let route = router
+        .route(
+            "truncation-contract",
+            &[turn("user", text)],
+            &EpisodeState::new(7),
+        )
+        .await
+        .context("run 262k native truncation contract")?;
+    anyhow::ensure!(route.telemetry.truncated_tokens > 0);
+    anyhow::ensure!(route.telemetry.encode_mode == "full_truncation_fallback");
     Ok(())
 }
 
@@ -93,8 +133,7 @@ async fn native_runtime_fails_closed_on_budget_and_wrong_device() -> Result<()> 
     let Some((runtime, binary, gguf, device)) = configured_paths() else {
         return Ok(());
     };
-    let mut budgeted =
-        NativeEncoderOptions::c82(binary.clone(), gguf.clone(), device.clone());
+    let mut budgeted = NativeEncoderOptions::c82(binary.clone(), gguf.clone(), device.clone());
     budgeted.memory_budget_gib = Some(0.5);
     let router = C82Router::load_native(&runtime, budgeted).await?;
     anyhow::ensure!(router.health().await.is_err());

@@ -55,6 +55,18 @@ pub struct EncoderHealth {
     pub pooling: String,
     pub serialization: String,
     pub kv_chunk_tokens: usize,
+    #[serde(default)]
+    pub flash_attention: Option<bool>,
+    #[serde(default)]
+    pub physical_batch_tokens: Option<usize>,
+    #[serde(default)]
+    pub max_sessions: Option<usize>,
+    #[serde(default)]
+    pub kv_cache_type: Option<String>,
+    #[serde(default)]
+    pub kv_unified: Option<bool>,
+    #[serde(default)]
+    pub swa_full: Option<bool>,
     pub kv_sessions: usize,
     pub kv_resident_tokens: usize,
     pub kv_evictions: usize,
@@ -425,6 +437,12 @@ impl C82Router {
                 || health.python_used
                 || !health.backend_active
                 || !matches!(health.device.as_str(), "metal" | "cuda" | "cpu")
+                || health.flash_attention != Some(native.flash_attention)
+                || health.physical_batch_tokens != Some(native.physical_batch_tokens)
+                || health.max_sessions != Some(native.max_sessions)
+                || health.kv_cache_type.as_deref() != Some(native.kv_cache_type.as_str())
+                || health.kv_unified != Some(native.kv_unified)
+                || health.swa_full != Some(native.swa_full)
             {
                 return Err(anyhow!(
                     "C82 native encoder did not prove the pinned libllama backend"

@@ -874,20 +874,13 @@ fn download_file_to_path(
         fs::create_dir_all(parent).map_err(|e| format!("Failed to create directory: {e}"))?;
     }
 
-    let mut client_builder = reqwest::blocking::Client::builder()
+    let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(3600))
         .connect_timeout(Duration::from_secs(30))
-        .tcp_keepalive(Duration::from_secs(30));
-    if let Some(token) = hf_token() {
-        let mut headers = reqwest::header::HeaderMap::new();
-        let value = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
-            .map_err(|_| "Hugging Face token contains invalid header characters".to_string())?;
-        headers.insert(reqwest::header::AUTHORIZATION, value);
-        client_builder = client_builder.default_headers(headers);
-    }
-    let client = client_builder
+        .tcp_keepalive(Duration::from_secs(30))
         .build()
         .map_err(|e| format!("Failed to create HTTP client: {e}"))?;
+    let token = hf_token();
 
     // No unconditional pre-delete here: the caller (download_to_hf_cache)
     // already validates that any pre-existing tmp file belongs to this same
@@ -907,6 +900,7 @@ fn download_file_to_path(
             bytes_offset,
             total_override,
             report_filename,
+            token.as_deref(),
         ) {
             Ok(bytes) => return Ok(bytes),
             Err(DownloadAttemptError::Cancelled) => {
@@ -966,6 +960,7 @@ fn attempt_download(
     bytes_offset: u64,
     total_override: u64,
     report_filename: Option<&str>,
+    token: Option<&str>,
 ) -> Result<u64, DownloadAttemptError> {
     // Honor any partial file on disk — either retained from a previous
     // process invocation (via the .tmp.url sidecar guarding the call site)
@@ -973,6 +968,9 @@ fn attempt_download(
     let existing_bytes = fs::metadata(dest_path).map(|m| m.len()).unwrap_or(0);
 
     let mut request = client.get(url).header("User-Agent", "rayline");
+    if let Some(token) = token {
+        request = request.bearer_auth(token);
+    }
     if existing_bytes > 0 {
         request = request.header("Range", format!("bytes={existing_bytes}-"));
     }
