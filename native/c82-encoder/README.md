@@ -20,6 +20,12 @@ failing path. A 512-token physical micro-batch also avoids the upstream Metal
 page fault observed at the 262,144-token boundary with a 2,048-token
 micro-batch; the logical incremental checkpoint grid remains 8,192 tokens.
 
+Startup executes a real forward and audits libllama’s scheduled buffers.
+Readiness requires selected-device model compute and zero compute nodes on any
+other device. The health record separately reports the observed host-side token
+lookup and metadata views as boundary staging, rather than hiding them as GPU
+compute or misclassifying them as fallback.
+
 Configure an audited checkout with:
 
 ```sh

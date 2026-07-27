@@ -139,6 +139,57 @@ void native_encoder::batch_deleter::operator()(llama_batch * batch) const {
     }
 }
 
+bool native_encoder::backend_eval_callback(
+    ggml_tensor * tensor,
+    bool ask,
+    void * user_data) {
+    if (!ask
+        || tensor == nullptr
+        || tensor->op == GGML_OP_NONE
+        || tensor->buffer == nullptr
+        || user_data == nullptr) {
+        return false;
+    }
+    auto * runtime = static_cast<native_encoder *>(user_data);
+    const auto buffer_type = ggml_backend_buffer_get_type(tensor->buffer);
+    const auto buffer_device = ggml_backend_buft_get_device(buffer_type);
+    const bool selected =
+        buffer_device == runtime->device_
+        || (runtime->resolved_device_ == "cpu"
+            && ggml_backend_buffer_is_host(tensor->buffer));
+    if (selected) {
+        ++runtime->selected_device_compute_nodes_;
+    } else if (
+        runtime->resolved_device_ != "cpu"
+        && (tensor->op == GGML_OP_VIEW
+            || (tensor->op == GGML_OP_GET_ROWS
+                && std::string(tensor->name) == "model.input_embed"))) {
+        // libllama materializes token lookup and metadata-only views at the
+        // host/device boundary. They are observed staging nodes, not a
+        // scheduler fallback for model compute.
+        ++runtime->host_boundary_nodes_;
+    } else {
+        ++runtime->other_device_compute_nodes_;
+        const char * device_name =
+            buffer_device == nullptr
+                ? "host"
+                : ggml_backend_dev_name(buffer_device);
+        const std::string observed =
+            std::string(tensor->name)
+            + " (" + ggml_op_name(tensor->op)
+            + " on " + device_name + ")";
+        if (runtime->first_other_device_node_.empty()) {
+            runtime->first_other_device_node_ = observed;
+        } else if (
+            runtime->first_other_device_node_.size() < 2'048
+            && runtime->first_other_device_node_.find(observed)
+                == std::string::npos) {
+            runtime->first_other_device_node_ += "; " + observed;
+        }
+    }
+    return false;
+}
+
 native_encoder::native_encoder(native_encoder_options options)
     : options_(std::move(options)),
       started_at_(std::chrono::steady_clock::now()) {
@@ -245,6 +296,8 @@ native_encoder::native_encoder(native_encoder_options options)
     context_params.no_perf = true;
     context_params.type_k = GGML_TYPE_BF16;
     context_params.type_v = GGML_TYPE_BF16;
+    context_params.cb_eval = backend_eval_callback;
+    context_params.cb_eval_user_data = this;
     context_.reset(llama_init_from_model(model_.get(), context_params));
     if (!context_) {
         throw std::runtime_error("failed to initialize the native C82 context");
@@ -271,6 +324,22 @@ native_encoder::native_encoder(native_encoder_options options)
     free_sequence_ids_.reserve(options_.max_sessions);
     for (size_t index = options_.max_sessions; index > 0; --index) {
         free_sequence_ids_.push_back(static_cast<llama_seq_id>(index - 1));
+    }
+    const auto probe = serializer_->tokenize(json::array({
+        {
+            {"role", "user"},
+            {"text", "C82 native backend readiness probe."},
+        },
+    }));
+    static_cast<void>(encode_without_session(probe.input_ids));
+    if (selected_device_compute_nodes_ == 0) {
+        throw std::runtime_error(
+            "native C82 readiness probe observed no selected-device compute");
+    }
+    if (resolved_device_ != "cpu" && other_device_compute_nodes_ > 0) {
+        throw std::runtime_error(
+            "native C82 readiness probe observed mixed-device compute at "
+            + first_other_device_node_);
     }
 }
 
@@ -306,11 +375,19 @@ json native_encoder::health() {
         {"backend", "libllama"},
         {"backend_revision", RAYLINE_LLAMA_COMMIT},
         {"device", resolved_device_},
-        {"backend_active", true},
+        {"backend_active", selected_device_compute_nodes_ > 0},
         {"python_used", false},
         {"torch_version", "not-used"},
         {"bf16_supported", true},
-        {"mixed_device_fallback", false},
+        {"mixed_device_fallback",
+            resolved_device_ != "cpu" && other_device_compute_nodes_ > 0},
+        {"selected_device_compute_nodes", selected_device_compute_nodes_},
+        {"host_boundary_nodes", host_boundary_nodes_},
+        {"other_device_compute_nodes", other_device_compute_nodes_},
+        {"first_other_device_node",
+            first_other_device_node_.empty()
+                ? json(nullptr)
+                : json(first_other_device_node_)},
         {"encoder_model", encoder_model},
         {"encoder_revision", encoder_revision},
         {"encoder_dimension", embedding_dimension_},

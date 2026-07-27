@@ -67,6 +67,12 @@ pub struct EncoderHealth {
     pub kv_unified: Option<bool>,
     #[serde(default)]
     pub swa_full: Option<bool>,
+    #[serde(default)]
+    pub selected_device_compute_nodes: Option<usize>,
+    #[serde(default)]
+    pub host_boundary_nodes: Option<usize>,
+    #[serde(default)]
+    pub other_device_compute_nodes: Option<usize>,
     pub kv_sessions: usize,
     pub kv_resident_tokens: usize,
     pub kv_evictions: usize,
@@ -443,6 +449,8 @@ impl C82Router {
                 || health.kv_cache_type.as_deref() != Some(native.kv_cache_type.as_str())
                 || health.kv_unified != Some(native.kv_unified)
                 || health.swa_full != Some(native.swa_full)
+                || health.selected_device_compute_nodes.unwrap_or_default() == 0
+                || health.other_device_compute_nodes != Some(0)
             {
                 return Err(anyhow!(
                     "C82 native encoder did not prove the pinned libllama backend"

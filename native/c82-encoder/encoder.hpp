@@ -92,6 +92,10 @@ private:
     void restore_sequence(
         llama_seq_id sequence_id,
         const std::vector<uint8_t> & snapshot);
+    static bool backend_eval_callback(
+        ggml_tensor * tensor,
+        bool ask,
+        void * user_data);
 
     void validate_device() const;
     void reclaim_idle();
@@ -122,5 +126,9 @@ private:
     std::vector<llama_seq_id> free_sequence_ids_;
     size_t evictions_ = 0;
     size_t requests_ = 0;
+    size_t selected_device_compute_nodes_ = 0;
+    size_t host_boundary_nodes_ = 0;
+    size_t other_device_compute_nodes_ = 0;
+    std::string first_other_device_node_;
     std::chrono::steady_clock::time_point started_at_;
 };
