@@ -374,3 +374,38 @@ pub fn verify_file_hash(path: &Path, expected: &str) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::*;
+
+    #[test]
+    fn corrupted_runtime_file_fails_hash_verification() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should follow the Unix epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "rayline-mtrouter-corrupt-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::write(&path, b"trusted bytes").expect("write hash fixture");
+        let trusted = format!("{:x}", Sha256::digest(b"trusted bytes"));
+        verify_file_hash(&path, &trusted).expect("trusted fixture should verify");
+
+        fs::write(&path, b"corrupted bytes").expect("corrupt hash fixture");
+        let error =
+            verify_file_hash(&path, &trusted).expect_err("corrupted fixture must fail closed");
+        assert!(error.to_string().contains("SHA256 mismatch"));
+        fs::remove_file(path).expect("remove hash fixture");
+    }
+
+    #[test]
+    fn malformed_expected_hash_is_rejected() {
+        let error = verify_file_hash(Path::new("unused"), "not-a-sha256")
+            .expect_err("malformed expected hash must be rejected");
+        assert!(error.to_string().contains("invalid expected SHA256"));
+    }
+}

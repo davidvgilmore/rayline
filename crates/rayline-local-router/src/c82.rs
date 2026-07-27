@@ -9,7 +9,7 @@ use futures::StreamExt as _;
 use http_body_util::StreamBody;
 use hyper::body::Frame;
 use hyper::header::{HeaderName, HeaderValue};
-use hyper::{HeaderMap, Response};
+use hyper::{HeaderMap, Response, StatusCode};
 use rayline_metrics::{MetricsUpdate, REQUEST_ID_HEADER, SharedMetricsSink, new_request_id};
 use rayline_mtrouter::{C82Router, EpisodeState, HistoryTurn, Route, WorkerManifest};
 use serde_json::{Value, json};
@@ -109,17 +109,12 @@ impl C82Runtime {
             .and_then(header_str)
             .map(ToOwned::to_owned)
             .unwrap_or_else(new_request_id);
-        let episode = {
-            let mut episodes = self.episodes.lock().await;
-            episodes
-                .entry(episode_id.clone())
-                .or_insert_with(|| {
-                    Arc::new(Mutex::new(EpisodeState::new(
-                        self.router.manifest().workers.len(),
-                    )))
-                })
-                .clone()
-        };
+        let episode = episode_state(
+            &self.episodes,
+            &episode_id,
+            self.router.manifest().workers.len(),
+        )
+        .await;
         // Hold this through upstream response headers: a successful response
         // commits exactly once, while a pre-response failure rolls state back.
         let mut state = episode.lock().await;
@@ -140,14 +135,13 @@ impl C82Runtime {
             .await?;
         let upstream_header_latency_ms = upstream_started.elapsed().as_millis() as u64;
         let status = response.status();
-        let committed = status.is_success();
-        if committed {
-            state.commit(
-                route.decision.selected_arm,
-                route.telemetry.serialized_tokens,
-                Instant::now(),
-            );
-        }
+        let committed = commit_response_state(
+            &mut state,
+            status,
+            route.decision.selected_arm,
+            route.telemetry.serialized_tokens,
+            Instant::now(),
+        );
         let next_turn_index = state.turn_index;
         drop(state);
 
@@ -224,8 +218,7 @@ impl C82Runtime {
             match outbound.send().await {
                 Ok(response) => {
                     let status = response.status();
-                    let retryable = status == reqwest::StatusCode::TOO_MANY_REQUESTS
-                        || status.is_server_error();
+                    let retryable = is_retryable_status(status);
                     let delay = if retryable && attempt < total_attempts {
                         retry_delay(worker, attempt)
                     } else {
@@ -371,6 +364,36 @@ impl C82Runtime {
     }
 }
 
+async fn episode_state(
+    episodes: &Mutex<HashMap<String, Arc<Mutex<EpisodeState>>>>,
+    episode_id: &str,
+    worker_count: usize,
+) -> Arc<Mutex<EpisodeState>> {
+    let mut episodes = episodes.lock().await;
+    episodes
+        .entry(episode_id.to_owned())
+        .or_insert_with(|| Arc::new(Mutex::new(EpisodeState::new(worker_count))))
+        .clone()
+}
+
+fn commit_response_state(
+    state: &mut EpisodeState,
+    status: StatusCode,
+    selected_arm: usize,
+    input_tokens: usize,
+    now: Instant,
+) -> bool {
+    if !status.is_success() {
+        return false;
+    }
+    state.commit(selected_arm, input_tokens, now);
+    true
+}
+
+fn is_retryable_status(status: StatusCode) -> bool {
+    status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+}
+
 fn dispatch_request_shape(dispatch: &Value) -> Value {
     let Some(object) = dispatch.as_object() else {
         return json!({"top_level_keys":[]});
@@ -468,11 +491,16 @@ fn remove_anthropic_only_controls(object: &mut serde_json::Map<String, Value>) {
 }
 
 fn retry_delay(worker: &WorkerManifest, failed_attempt: u64) -> Duration {
-    let exponent = i32::try_from(failed_attempt.saturating_sub(1).min(30)).unwrap_or(30);
-    Duration::from_secs_f64(
-        (worker.openrouter_retry_base_seconds * 2_f64.powi(exponent))
-            .min(worker.openrouter_retry_cap_seconds),
+    retry_delay_for(
+        worker.openrouter_retry_base_seconds,
+        worker.openrouter_retry_cap_seconds,
+        failed_attempt,
     )
+}
+
+fn retry_delay_for(base_seconds: f64, cap_seconds: f64, failed_attempt: u64) -> Duration {
+    let exponent = i32::try_from(failed_attempt.saturating_sub(1).min(30)).unwrap_or(30);
+    Duration::from_secs_f64((base_seconds * 2_f64.powi(exponent)).min(cap_seconds))
 }
 
 fn transport_error_class(error: &reqwest::Error) -> &'static str {
@@ -853,6 +881,69 @@ fn rewrite_models(value: &mut Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn same_episode_requests_share_one_serial_lock() {
+        let episodes = Mutex::new(HashMap::new());
+        let first = episode_state(&episodes, "episode-a", 7).await;
+        let second = episode_state(&episodes, "episode-a", 7).await;
+        let other = episode_state(&episodes, "episode-b", 7).await;
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(!Arc::ptr_eq(&first, &other));
+
+        let guard = first.lock().await;
+        let waiter = tokio::spawn(async move {
+            let state = second.lock().await;
+            state.turn_index
+        });
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+        drop(guard);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), waiter)
+                .await
+                .expect("same-episode waiter should be released")
+                .expect("same-episode waiter should not panic"),
+            0
+        );
+    }
+
+    #[test]
+    fn response_headers_define_commit_and_rollback_boundary() {
+        let now = Instant::now();
+        let mut state = EpisodeState::new(7);
+        assert!(!commit_response_state(
+            &mut state,
+            StatusCode::BAD_GATEWAY,
+            3,
+            128,
+            now,
+        ));
+        assert_eq!(state.turn_index, 0);
+        assert_eq!(state.previous_arm, None);
+
+        assert!(commit_response_state(
+            &mut state,
+            StatusCode::OK,
+            3,
+            128,
+            now,
+        ));
+        assert_eq!(state.turn_index, 1);
+        assert_eq!(state.previous_arm, Some(3));
+        assert_eq!(state.warmth[3].as_ref().unwrap().last_input_tokens, 128);
+    }
+
+    #[test]
+    fn retry_classification_and_backoff_are_bounded() {
+        assert!(is_retryable_status(StatusCode::TOO_MANY_REQUESTS));
+        assert!(is_retryable_status(StatusCode::INTERNAL_SERVER_ERROR));
+        assert!(!is_retryable_status(StatusCode::BAD_REQUEST));
+        assert!(!is_retryable_status(StatusCode::OK));
+        assert_eq!(retry_delay_for(2.0, 30.0, 1), Duration::from_secs(2));
+        assert_eq!(retry_delay_for(2.0, 30.0, 2), Duration::from_secs(4));
+        assert_eq!(retry_delay_for(2.0, 30.0, 8), Duration::from_secs(30));
+    }
 
     #[test]
     fn tool_rendering_matches_compact_json_spacing_and_ascii() {

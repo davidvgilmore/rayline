@@ -195,3 +195,79 @@ impl NativeEncoderClient {
         result.map_err(anyhow::Error::msg)
     }
 }
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use serde_json::json;
+
+    use super::*;
+
+    fn temp_dir(label: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should follow the Unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "rayline-mtrouter-{label}-{}-{nonce}",
+            std::process::id()
+        ))
+    }
+
+    fn write_executable(path: &std::path::Path, body: &str) {
+        fs::write(path, body).expect("write fake native helper");
+        let mut permissions = fs::metadata(path)
+            .expect("read fake native helper metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).expect("make fake native helper executable");
+    }
+
+    #[tokio::test]
+    async fn helper_exit_fails_closed() {
+        let directory = temp_dir("helper-exit");
+        fs::create_dir_all(&directory).expect("create fake native runtime");
+        let binary = directory.join("encoder");
+        let model = directory.join("model.gguf");
+        write_executable(&binary, "#!/bin/sh\nexit 17\n");
+        fs::write(&model, b"fixture").expect("write fake model");
+
+        let client =
+            NativeEncoderClient::spawn(NativeEncoderOptions::c82(binary, model, "cpu".to_owned()))
+                .await
+                .expect("spawn fake native helper");
+        let error = client
+            .call(json!({"op":"health"}))
+            .await
+            .expect_err("dead helper must fail closed");
+        assert!(error.to_string().contains("native encoder"));
+        fs::remove_dir_all(directory).expect("remove fake native runtime");
+    }
+
+    #[tokio::test]
+    async fn malformed_helper_response_fails_closed() {
+        let directory = temp_dir("malformed-response");
+        fs::create_dir_all(&directory).expect("create fake native runtime");
+        let binary = directory.join("encoder");
+        let model = directory.join("model.gguf");
+        write_executable(
+            &binary,
+            "#!/bin/sh\nIFS= read -r request\nprintf 'not-json\\n'\n",
+        );
+        fs::write(&model, b"fixture").expect("write fake model");
+
+        let client =
+            NativeEncoderClient::spawn(NativeEncoderOptions::c82(binary, model, "cpu".to_owned()))
+                .await
+                .expect("spawn fake native helper");
+        let error = client
+            .call(json!({"op":"health"}))
+            .await
+            .expect_err("malformed helper response must fail closed");
+        assert!(error.to_string().contains("parse native encoder response"));
+        fs::remove_dir_all(directory).expect("remove fake native runtime");
+    }
+}
