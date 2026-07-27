@@ -14,6 +14,7 @@ use sha2::{Digest, Sha256};
 const DEFAULT_CLAUDE_SETTINGS_SUFFIX: &str = ".claude/settings.json";
 const DEFAULT_MODEL: &str = "rayline-router";
 const DEFAULT_PROXY_SUBAGENTS_MODEL: &str = "claude-sonnet-4-6";
+const C82_LOOPBACK_AUTH_TOKEN: &str = "rayline-c82-loopback-only";
 const DEFAULT_ROUTER_KEY_NAME: &str = "rayline-cli";
 const DEFAULT_AUTO_COMPACT_WINDOW: &str = "180000";
 const DEFAULT_AUTO_COMPACT_WINDOW_1M: &str = "950000";
@@ -1313,7 +1314,12 @@ async fn configure_proxy_env(
     let no_proxy = append_no_proxy(&existing_no_proxy, &["localhost", "127.0.0.1", "::1"]);
     command.env("NO_PROXY", &no_proxy);
     command.env("no_proxy", no_proxy);
-    configure_proxy_auth_env(command, request.routing_mode);
+    configure_proxy_auth_env(
+        command,
+        request.routing_mode,
+        request.orchestrator.as_deref() == Some("c82")
+            && request.routing_mode == RoutingMode::Proxy,
+    );
     Ok(())
 }
 
@@ -1327,7 +1333,7 @@ fn should_set_model_env(
         || inherited_anthropic_model
 }
 
-fn configure_proxy_auth_env(command: &mut Command, routing_mode: RoutingMode) {
+fn configure_proxy_auth_env(command: &mut Command, routing_mode: RoutingMode, c82_route_all: bool) {
     if routing_mode == RoutingMode::ProxySubagents {
         command.env_remove("ANTHROPIC_BASE_URL");
         command.env_remove("ANTHROPIC_AUTH_TOKEN");
@@ -1337,7 +1343,57 @@ fn configure_proxy_auth_env(command: &mut Command, routing_mode: RoutingMode) {
         command.env_remove("ANTHROPIC_BASE_URL");
         command.env_remove("ANTHROPIC_API_KEY");
     }
+    if c82_route_all {
+        // Claude Code refuses to start without either a subscription login or
+        // an API credential. C82 route-all never dispatches Messages requests
+        // to Anthropic: the loopback proxy sends them to the local router,
+        // which authenticates to OpenRouter independently. Supply a public
+        // sentinel so bring-your-OpenRouter users need no Anthropic account.
+        command.env("ANTHROPIC_AUTH_TOKEN", C82_LOOPBACK_AUTH_TOKEN);
+    }
     command.env_remove("RAYLINE_ROUTER_API_KEY");
+}
+
+#[cfg(test)]
+mod proxy_auth_env_tests {
+    use super::*;
+    use std::ffi::{OsStr, OsString};
+
+    fn explicit_env(command: &Command, name: &str) -> Option<Option<OsString>> {
+        command
+            .get_envs()
+            .find(|(key, _)| *key == OsStr::new(name))
+            .map(|(_, value)| value.map(OsStr::to_os_string))
+    }
+
+    #[test]
+    fn c82_route_all_uses_a_public_loopback_auth_sentinel() {
+        let mut command = Command::new("claude");
+        configure_proxy_auth_env(&mut command, RoutingMode::Proxy, true);
+
+        assert_eq!(
+            explicit_env(&command, "ANTHROPIC_AUTH_TOKEN"),
+            Some(Some(OsString::from(C82_LOOPBACK_AUTH_TOKEN)))
+        );
+        assert_eq!(explicit_env(&command, "ANTHROPIC_API_KEY"), Some(None));
+        assert_eq!(explicit_env(&command, "ANTHROPIC_BASE_URL"), Some(None));
+    }
+
+    #[test]
+    fn ordinary_proxy_mode_still_requires_the_users_claude_login() {
+        let mut command = Command::new("claude");
+        configure_proxy_auth_env(&mut command, RoutingMode::Proxy, false);
+
+        assert_eq!(explicit_env(&command, "ANTHROPIC_AUTH_TOKEN"), Some(None));
+    }
+
+    #[test]
+    fn subagent_passthrough_does_not_receive_the_c82_sentinel() {
+        let mut command = Command::new("claude");
+        configure_proxy_auth_env(&mut command, RoutingMode::ProxySubagents, false);
+
+        assert_eq!(explicit_env(&command, "ANTHROPIC_AUTH_TOKEN"), Some(None));
+    }
 }
 
 fn resolve_injector_port(explicit: Option<u16>) -> Result<u16, RunError> {
