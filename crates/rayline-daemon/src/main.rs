@@ -103,9 +103,9 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     /// Run llama-server + adapter + injector under one supervisor (foreground).
-    Serve(ServeArgs),
+    Serve(Box<ServeArgs>),
     /// Run only the transparent Claude Code HTTPS proxy (foreground).
-    Proxy(ProxyArgs),
+    Proxy(Box<ProxyArgs>),
     /// Render the router's per-turn picked model for a Claude Code status line.
     Statusline(StatuslineArgs),
     /// Inspect cached GGUFs.
@@ -378,8 +378,8 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Serve(args) => run_serve(args).await,
-        Cmd::Proxy(args) => run_proxy(args).await,
+        Cmd::Serve(args) => run_serve(*args).await,
+        Cmd::Proxy(args) => run_proxy(*args).await,
         Cmd::Statusline(args) => {
             statusline::run(resolve_route_status_path(args.route_status_path));
             Ok(())
@@ -1449,14 +1449,14 @@ mod tests {
 
     fn parse_serve(argv: &[&str]) -> ServeArgs {
         match Cli::try_parse_from(argv).unwrap().cmd {
-            Cmd::Serve(args) => args,
+            Cmd::Serve(args) => *args,
             _ => panic!("expected serve subcommand"),
         }
     }
 
     fn parse_proxy(argv: &[&str]) -> ProxyArgs {
         match Cli::try_parse_from(argv).unwrap().cmd {
-            Cmd::Proxy(args) => args,
+            Cmd::Proxy(args) => *args,
             _ => panic!("expected proxy subcommand"),
         }
     }
