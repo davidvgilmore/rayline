@@ -106,6 +106,7 @@ pub struct NativeEncoderManifest {
     pub kv_cache_type: String,
     pub kv_unified: bool,
     pub swa_full: bool,
+    pub cuda_nccl: bool,
     pub gguf_conversion_command: String,
     pub gguf: NativeFileManifest,
     pub binaries: Vec<NativeBinaryManifest>,
@@ -248,6 +249,7 @@ impl Manifest {
                 || native.kv_cache_type != "BF16"
                 || native.kv_unified
                 || native.swa_full
+                || native.cuda_nccl
                 || native.gguf_conversion_command.is_empty()
                 || native.gguf.file.is_empty()
                 || native.binaries.is_empty()

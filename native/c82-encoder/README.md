@@ -19,6 +19,9 @@ response pin this choice so an upstream upgrade cannot silently re-enable the
 failing path. A 512-token physical micro-batch also avoids the upstream Metal
 page fault observed at the 262,144-token boundary with a 2,048-token
 micro-batch; the logical incremental checkpoint grid remains 8,192 tokens.
+CUDA builds also disable NCCL: C82 owns one user GPU, so a collective
+communication dependency would add no value and would make the portable helper
+require a separately installed `libnccl`.
 
 Startup executes a real forward and audits libllama’s scheduled buffers.
 Readiness requires selected-device model compute and zero compute nodes on any

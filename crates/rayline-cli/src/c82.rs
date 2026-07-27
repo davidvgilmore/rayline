@@ -285,6 +285,7 @@ pub async fn doctor(request: &DoctorRequest) -> io::Result<String> {
             "selected_device_compute_nodes": health.selected_device_compute_nodes,
             "host_boundary_nodes": health.host_boundary_nodes,
             "other_device_compute_nodes": health.other_device_compute_nodes,
+            "cuda_nccl": health.cuda_nccl,
             "device_free_bytes": health.device_free_bytes,
             "device_total_bytes": health.device_total_bytes,
             "device_allocated_bytes": health.device_allocated_bytes,

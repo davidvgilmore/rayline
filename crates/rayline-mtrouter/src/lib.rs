@@ -68,6 +68,8 @@ pub struct EncoderHealth {
     #[serde(default)]
     pub swa_full: Option<bool>,
     #[serde(default)]
+    pub cuda_nccl: Option<bool>,
+    #[serde(default)]
     pub selected_device_compute_nodes: Option<usize>,
     #[serde(default)]
     pub host_boundary_nodes: Option<usize>,
@@ -449,6 +451,7 @@ impl C82Router {
                 || health.kv_cache_type.as_deref() != Some(native.kv_cache_type.as_str())
                 || health.kv_unified != Some(native.kv_unified)
                 || health.swa_full != Some(native.swa_full)
+                || health.cuda_nccl != Some(native.cuda_nccl)
                 || health.selected_device_compute_nodes.unwrap_or_default() == 0
                 || health.other_device_compute_nodes != Some(0)
             {

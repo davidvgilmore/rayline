@@ -401,6 +401,7 @@ json native_encoder::health() {
         {"kv_cache_type", "BF16"},
         {"kv_unified", false},
         {"swa_full", false},
+        {"cuda_nccl", RAYLINE_CUDA_NCCL != 0},
         {"kv_sessions", sessions_.size()},
         {"kv_resident_tokens", resident_tokens()},
         {"kv_session_budget_tokens", options_.session_budget_tokens},

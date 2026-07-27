@@ -56,6 +56,11 @@ add_executable(
     main.cpp
     token_blocks.cpp
 )
+if(GGML_CUDA AND GGML_CUDA_NCCL)
+    set(RAYLINE_CUDA_NCCL 1)
+else()
+    set(RAYLINE_CUDA_NCCL 0)
+endif()
 target_link_libraries(rayline-c82-encoder PRIVATE llama)
 target_include_directories(
     rayline-c82-encoder
@@ -68,6 +73,7 @@ target_compile_definitions(
     rayline-c82-encoder
     PRIVATE
         RAYLINE_LLAMA_COMMIT="${RAYLINE_LLAMA_COMMIT}"
+        RAYLINE_CUDA_NCCL=${RAYLINE_CUDA_NCCL}
 )
 target_compile_options(
     rayline-c82-encoder
