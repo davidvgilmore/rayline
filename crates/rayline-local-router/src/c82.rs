@@ -22,6 +22,7 @@ use super::{BoxBody, C82_ARTIFACT_COMMIT, C82Options, full_body, header_str, is_
 const EPISODE_HEADER: &str = "x-rayline-episode-id";
 const PUBLIC_MODEL_ALIAS: &str = "rayline/router";
 const READY_TIMEOUT: Duration = Duration::from_secs(300);
+const DEFAULT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(600);
 
 pub(crate) struct C82Runtime {
     options: C82Options,
@@ -178,7 +179,7 @@ impl C82Runtime {
                 agent_type: None,
             });
         }
-        response_to_client(response, &request_id, &worker.id).await
+        response_to_client(response, &request_id, &worker.id, metrics.cloned()).await
     }
 
     async fn dispatch_with_retries(
@@ -212,9 +213,7 @@ impl C82Runtime {
             // those beta headers makes OpenRouter reject otherwise-portable
             // custom tool schemas. `policy_owned_dispatch` materializes those
             // tools, so no Anthropic beta header is needed here.
-            if let Some(deadline) = worker.attempt_deadline_seconds {
-                outbound = outbound.timeout(Duration::from_secs_f64(deadline));
-            }
+            outbound = outbound.timeout(attempt_timeout(worker.attempt_deadline_seconds));
             match outbound.send().await {
                 Ok(response) => {
                     let status = response.status();
@@ -719,6 +718,7 @@ async fn response_to_client(
     response: reqwest::Response,
     request_id: &str,
     selected_worker: &str,
+    metrics: Option<SharedMetricsSink>,
 ) -> Result<Response<BoxBody>> {
     let status = response.status();
     let content_type = response
@@ -755,14 +755,18 @@ async fn response_to_client(
     );
     if content_type.contains("text/event-stream") {
         let (tx, rx) = mpsc::channel::<io::Result<Frame<Bytes>>>(16);
+        let request_id = request_id.to_owned();
+        let selected_worker = selected_worker.to_owned();
         tokio::spawn(async move {
             let mut upstream = response.bytes_stream();
             let mut buffer = Vec::new();
+            let mut outcome = SseOutcome::default();
             while let Some(chunk) = upstream.next().await {
                 match chunk {
                     Ok(chunk) => {
                         buffer.extend_from_slice(&chunk);
                         while let Some((frame, consumed)) = next_sse_frame(&buffer) {
+                            observe_sse_frame(&frame, &mut outcome);
                             let rewritten = rewrite_sse_frame(&frame);
                             buffer.drain(..consumed);
                             if tx
@@ -770,25 +774,59 @@ async fn response_to_client(
                                 .await
                                 .is_err()
                             {
+                                record_response_terminal(
+                                    metrics.as_ref(),
+                                    &request_id,
+                                    &selected_worker,
+                                    status,
+                                    Some("C82 downstream stream closed".to_owned()),
+                                );
                                 return;
                             }
                         }
                     }
                     Err(error) => {
-                        let _ = tx
-                            .send(Err(io::Error::other(format!(
-                                "C82 upstream stream failed: {}",
-                                transport_error_class(&error)
-                            ))))
-                            .await;
+                        let error = format!(
+                            "C82 upstream stream failed: {}",
+                            transport_error_class(&error)
+                        );
+                        let _ = tx.send(Err(io::Error::other(error.clone()))).await;
+                        record_response_terminal(
+                            metrics.as_ref(),
+                            &request_id,
+                            &selected_worker,
+                            status,
+                            Some(error),
+                        );
                         return;
                     }
                 }
             }
             if !buffer.is_empty() {
+                observe_sse_frame(&buffer, &mut outcome);
                 let rewritten = rewrite_sse_frame(&buffer);
-                let _ = tx.send(Ok(Frame::data(Bytes::from(rewritten)))).await;
+                if tx
+                    .send(Ok(Frame::data(Bytes::from(rewritten))))
+                    .await
+                    .is_err()
+                {
+                    record_response_terminal(
+                        metrics.as_ref(),
+                        &request_id,
+                        &selected_worker,
+                        status,
+                        Some("C82 downstream stream closed".to_owned()),
+                    );
+                    return;
+                }
             }
+            record_response_terminal(
+                metrics.as_ref(),
+                &request_id,
+                &selected_worker,
+                status,
+                sse_terminal_error(&outcome),
+            );
         });
         let body = http_body_util::BodyExt::boxed(StreamBody::new(
             tokio_stream::wrappers::ReceiverStream::new(rx),
@@ -798,13 +836,29 @@ async fn response_to_client(
         *output.headers_mut() = headers;
         Ok(output)
     } else {
-        let body = response.bytes().await?;
+        let body = match response.bytes().await {
+            Ok(body) => body,
+            Err(error) => {
+                record_response_terminal(
+                    metrics.as_ref(),
+                    request_id,
+                    selected_worker,
+                    status,
+                    Some(format!(
+                        "C82 upstream body failed: {}",
+                        transport_error_class(&error)
+                    )),
+                );
+                return Err(error.into());
+            }
+        };
         let rewritten = serde_json::from_slice::<Value>(&body)
             .map(|mut value| {
-                rewrite_models(&mut value);
+                rewrite_response_models(&mut value);
                 serde_json::to_vec(&value).unwrap_or_else(|_| body.to_vec())
             })
             .unwrap_or_else(|_| body.to_vec());
+        record_response_terminal(metrics.as_ref(), request_id, selected_worker, status, None);
         let mut output = Response::new(full_body(rewritten));
         *output.status_mut() = status;
         *output.headers_mut() = headers;
@@ -843,7 +897,7 @@ fn rewrite_sse_frame(frame: &[u8]) -> Vec<u8> {
             if data != "[DONE]"
                 && let Ok(mut value) = serde_json::from_str::<Value>(data)
             {
-                rewrite_models(&mut value);
+                rewrite_response_models(&mut value);
                 output.push_str("data: ");
                 output.push_str(&serde_json::to_string(&value).unwrap_or_else(|_| data.to_owned()));
                 output.push_str(ending);
@@ -856,25 +910,103 @@ fn rewrite_sse_frame(frame: &[u8]) -> Vec<u8> {
     output.into_bytes()
 }
 
-fn rewrite_models(value: &mut Value) {
-    match value {
-        Value::Object(object) => {
-            if object.contains_key("model") {
-                object.insert(
-                    "model".to_owned(),
-                    Value::String(PUBLIC_MODEL_ALIAS.to_owned()),
-                );
-            }
-            for value in object.values_mut() {
-                rewrite_models(value);
-            }
+#[derive(Default)]
+struct SseOutcome {
+    saw_terminal: bool,
+    saw_error: bool,
+}
+
+fn observe_sse_frame(frame: &[u8], outcome: &mut SseOutcome) {
+    let Ok(text) = std::str::from_utf8(frame) else {
+        return;
+    };
+    for line in text.lines() {
+        let line = line.trim_end_matches('\r');
+        if line.trim().eq_ignore_ascii_case("event: error") {
+            outcome.saw_error = true;
         }
-        Value::Array(values) => {
-            for value in values {
-                rewrite_models(value);
-            }
+        let Some(data) = line.strip_prefix("data:").map(str::trim) else {
+            continue;
+        };
+        if data == "[DONE]" {
+            outcome.saw_terminal = true;
+            continue;
         }
-        _ => {}
+        let Ok(value) = serde_json::from_str::<Value>(data) else {
+            continue;
+        };
+        match value.get("type").and_then(Value::as_str) {
+            Some("message_stop") => outcome.saw_terminal = true,
+            Some("error") => outcome.saw_error = true,
+            _ => {}
+        }
+    }
+}
+
+fn sse_terminal_error(outcome: &SseOutcome) -> Option<String> {
+    if outcome.saw_error {
+        Some("C82 upstream emitted an SSE error event".to_owned())
+    } else if !outcome.saw_terminal {
+        Some("C82 upstream stream ended without a terminal event".to_owned())
+    } else {
+        None
+    }
+}
+
+fn rewrite_response_models(value: &mut Value) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    if object.contains_key("model") {
+        object.insert(
+            "model".to_owned(),
+            Value::String(PUBLIC_MODEL_ALIAS.to_owned()),
+        );
+    }
+    if object.get("type").and_then(Value::as_str) == Some("message_start")
+        && let Some(message) = object.get_mut("message").and_then(Value::as_object_mut)
+        && message.contains_key("model")
+    {
+        message.insert(
+            "model".to_owned(),
+            Value::String(PUBLIC_MODEL_ALIAS.to_owned()),
+        );
+    }
+}
+
+fn attempt_timeout(configured_seconds: Option<f64>) -> Duration {
+    configured_seconds
+        .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok())
+        .filter(|duration| !duration.is_zero())
+        .unwrap_or(DEFAULT_ATTEMPT_TIMEOUT)
+}
+
+fn record_response_terminal(
+    metrics: Option<&SharedMetricsSink>,
+    request_id: &str,
+    selected_worker: &str,
+    status: StatusCode,
+    error: Option<String>,
+) {
+    let Some(metrics) = metrics else {
+        return;
+    };
+    if let Some(error) =
+        error.or_else(|| (!status.is_success()).then(|| format!("upstream returned HTTP {status}")))
+    {
+        metrics.record(MetricsUpdate::RequestErrored {
+            request_id: request_id.to_owned(),
+            status_code: Some(status.as_u16()),
+            error,
+        });
+    } else {
+        metrics.record(MetricsUpdate::RequestCompleted {
+            request_id: request_id.to_owned(),
+            status_code: Some(status.as_u16()),
+            input_tokens: None,
+            output_tokens: None,
+            selected_model: Some(selected_worker.to_owned()),
+        });
     }
 }
 
@@ -943,6 +1075,10 @@ mod tests {
         assert_eq!(retry_delay_for(2.0, 30.0, 1), Duration::from_secs(2));
         assert_eq!(retry_delay_for(2.0, 30.0, 2), Duration::from_secs(4));
         assert_eq!(retry_delay_for(2.0, 30.0, 8), Duration::from_secs(30));
+        assert_eq!(attempt_timeout(None), DEFAULT_ATTEMPT_TIMEOUT);
+        assert_eq!(attempt_timeout(Some(42.0)), Duration::from_secs(42));
+        assert_eq!(attempt_timeout(Some(0.0)), DEFAULT_ATTEMPT_TIMEOUT);
+        assert_eq!(attempt_timeout(Some(f64::NAN)), DEFAULT_ATTEMPT_TIMEOUT);
     }
 
     #[test]
@@ -975,6 +1111,87 @@ mod tests {
         let rewritten = String::from_utf8(rewrite_sse_frame(frame)).unwrap();
         assert!(rewritten.contains("\"model\":\"rayline/router\""));
         assert!(!rewritten.contains("private/model"));
+    }
+
+    #[test]
+    fn sse_outcome_requires_terminal_success_without_error() {
+        let mut complete = SseOutcome::default();
+        observe_sse_frame(
+            b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+            &mut complete,
+        );
+        assert!(sse_terminal_error(&complete).is_none());
+
+        let mut failed = SseOutcome::default();
+        observe_sse_frame(
+            b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\"}}\n\n",
+            &mut failed,
+        );
+        assert!(sse_terminal_error(&failed).unwrap().contains("error event"));
+
+        let mut truncated = SseOutcome::default();
+        observe_sse_frame(
+            b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\"}\n\n",
+            &mut truncated,
+        );
+        assert!(
+            sse_terminal_error(&truncated)
+                .unwrap()
+                .contains("without a terminal")
+        );
+    }
+
+    #[test]
+    fn response_model_rewrite_preserves_tool_inputs() {
+        let mut response = json!({
+            "model":"private/model",
+            "content":[{
+                "type":"tool_use",
+                "name":"deploy",
+                "input":{"model":"user-selected/model"}
+            }]
+        });
+        rewrite_response_models(&mut response);
+        assert_eq!(response["model"], PUBLIC_MODEL_ALIAS);
+        assert_eq!(
+            response["content"][0]["input"]["model"],
+            "user-selected/model"
+        );
+    }
+
+    #[test]
+    fn response_terminal_metrics_close_active_records() {
+        use rayline_metrics::RouterMetrics;
+
+        let metrics = RouterMetrics::new("c82-test");
+        let sink: SharedMetricsSink = metrics.clone();
+        for request_id in ["completed", "errored"] {
+            sink.record(MetricsUpdate::RouteDecided {
+                request_id: request_id.to_owned(),
+                route_id: Some("c82-0".to_owned()),
+                target: "remote".to_owned(),
+                endpoint_id: Some("openrouter".to_owned()),
+                selected_model: Some("worker".to_owned()),
+                requested_model: Some(PUBLIC_MODEL_ALIAS.to_owned()),
+                policy: Some("c82".to_owned()),
+                task_class: Some("c82".to_owned()),
+                agent_id: None,
+                agent_type: None,
+            });
+        }
+        record_response_terminal(Some(&sink), "completed", "worker", StatusCode::OK, None);
+        record_response_terminal(
+            Some(&sink),
+            "errored",
+            "worker",
+            StatusCode::OK,
+            Some("stream failed".to_owned()),
+        );
+
+        let snapshot = metrics.snapshot();
+        assert!(snapshot.active.is_empty());
+        assert_eq!(snapshot.totals.completed_requests, 2);
+        assert_eq!(snapshot.totals.errored_requests, 1);
     }
 
     #[test]

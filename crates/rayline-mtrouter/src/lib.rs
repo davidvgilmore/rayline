@@ -171,12 +171,7 @@ impl C82Router {
                 .with_context(|| format!("read C82 head golden {}", path.display()))?,
         )
         .with_context(|| format!("parse C82 head golden {}", path.display()))?;
-        if fixture.schema_version != "rayline.mtrouter-head-golden.v1"
-            || fixture.checkpoint_sha256 != CHECKPOINT_SHA256
-            || fixture.pool.iter().map(String::as_str).collect::<Vec<_>>() != WORKER_ORDER
-        {
-            return Err(anyhow!("C82 head golden contract is incompatible"));
-        }
+        validate_head_golden_contract(&fixture)?;
         let tolerance = self
             .manifest
             .golden
@@ -539,6 +534,19 @@ struct HeadGoldenCase {
     selected_index: usize,
 }
 
+fn validate_head_golden_contract(fixture: &HeadGolden) -> Result<()> {
+    if fixture.schema_version != "rayline.mtrouter-head-golden.v1"
+        || fixture.checkpoint_sha256 != CHECKPOINT_SHA256
+        || fixture.pool.iter().map(String::as_str).collect::<Vec<_>>() != WORKER_ORDER
+    {
+        return Err(anyhow!("C82 head golden contract is incompatible"));
+    }
+    if fixture.cases.is_empty() {
+        return Err(anyhow!("C82 head golden has no cases"));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Deserialize)]
 struct EncoderGolden {
     schema_version: String,
@@ -669,5 +677,20 @@ mod tests {
         assert!(top_two_gap(&[1.0]).is_err());
         assert!(top_two_gap(&[1.0, f32::NAN]).is_err());
         assert_eq!(top_two_gap(&[1.0, 1.0, 0.0]).unwrap(), 0.0);
+    }
+
+    #[test]
+    fn empty_head_golden_is_rejected() {
+        let fixture: HeadGolden = serde_json::from_value(json!({
+            "schema_version":"rayline.mtrouter-head-golden.v1",
+            "checkpoint_sha256":CHECKPOINT_SHA256,
+            "score_tolerance":1.0e-5,
+            "pool":WORKER_ORDER,
+            "cases":[]
+        }))
+        .unwrap();
+        let error =
+            validate_head_golden_contract(&fixture).expect_err("empty fixture must fail closed");
+        assert!(error.to_string().contains("has no cases"));
     }
 }
