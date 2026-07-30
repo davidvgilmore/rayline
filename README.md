@@ -160,6 +160,11 @@ pins the BF16 GGUF, Metal and CUDA helpers, libllama revision, policy weights,
 provider order, retry behavior, and pricing snapshot. It is an experimental
 serving path, not a production-promotion claim.
 
+For the complete native and vLLM Semantic Router development environment,
+including Modal ARC encoding, Codex/Claude Code smoke commands, and the
+mmBERT-32K PII model, see the
+[C82 development guide](docs/c82-development.md).
+
 ## Use Rayline From Code or Agents
 
 You can also send your own Anthropic API traffic through Rayline — from a script
