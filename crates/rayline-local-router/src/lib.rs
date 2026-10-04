@@ -6,6 +6,7 @@
 //! provider endpoints, and local-model redirects.
 
 pub mod arc;
+mod arc_chat;
 pub mod arc_session;
 
 use std::collections::HashMap;
@@ -1253,8 +1254,18 @@ async fn handle_messages(state: AppState, req: Request<Incoming>) -> Result<Resp
                     .await
                 }
                 EndpointProtocol::OpenAIChat => {
-                    forward_openai_chat_endpoint(&state, endpoint, &decision, parsed, &request_id)
+                    if let Some(codec) = session_turn.as_ref().and_then(|turn| turn.codec.clone()) {
+                        arc_chat::forward(&state, endpoint, parsed, codec).await
+                    } else {
+                        forward_openai_chat_endpoint(
+                            &state,
+                            endpoint,
+                            &decision,
+                            parsed,
+                            &request_id,
+                        )
                         .await
+                    }
                 }
                 EndpointProtocol::OpenAIResponses => Err(anyhow!(
                     "endpoint {:?} uses openai_responses, which is only supported for /v1/responses requests",

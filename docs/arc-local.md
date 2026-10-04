@@ -187,3 +187,60 @@ and cancellation tests cover byte chunking, terminal validation and abort.
 These prove the public adapter's transport contract, not the service's planner
 or live model behavior. The earlier caller-managed limitations apply to replay;
 interactive session mode removes the need to construct those replay envelopes.
+
+### Messages sessions with prepared Chat providers
+
+An optional `arc.session.codec_sha256` enables a receipt-bound pinned response
+codec. Set it to the SHA256 of the operator-managed codec implementation. This
+mode still accepts ordinary native `/v1/messages` conversations. It sends their
+original source format to the ARC session service, which prepares the final
+Chat request and owns private steering and history conversion.
+
+Configure a named endpoint with `protocol: "openai_chat"` and its normal
+`base_url` ending in `/v1`. Bind the action to the exact provider model ID. Chat
+bindings accept only fixed `reasoning_effort`, `reasoning`, or
+`chat_template_kwargs` overrides; use an empty object for an explicit provider
+default. All actions for the same worker must have identical controls. Native
+Messages bindings keep `thinking` and `output_config`. Stage 2 does not change
+these fixed native controls. The complete configured action basket is submitted;
+an unsupported selected action is refused rather than silently replaced.
+
+The prepared receipt must retain `source_request_format: "anthropic_messages"`,
+use `request_format: "openai_chat"`, and include an exact `response_codec` object:
+
+```json
+{
+  "schema_version": "rayline.arc.response-codec.v1",
+  "source": "openai_chat",
+  "target": "anthropic_messages",
+  "implementation_sha256": "<configured SHA256>"
+}
+```
+
+The local session service adds `/experimental/arc/session/codec`. Calls bind the
+receipt owner, token, implementation pin and operation. Buffered `response`
+converts the provider body. Streaming uses `stream_start`, sequential
+`stream_push` calls carrying complete SSE frames, then `stream_finish`. Every
+reply must repeat the implementation pin. Rayline preserves the prepared body
+and uses the endpoint's ordinary configured authentication; it sends neither
+provider credentials nor inbound client authorization to the codec service.
+The ordinary Chat translator is bypassed on this prepared path.
+
+Rayline holds a translated native terminal until it observes a provider finish
+reason and a complete `[DONE]` frame, followed by successful codec finalization.
+Its existing session observer commits exact accepted native output and retains
+the queue through the settlement acknowledgement. A dropped response,
+truncated stream, codec refusal, or pin mismatch aborts the attempt. Failed or
+ambiguous settlement quarantines the process-owned session service identity;
+there is no automatic retry or reset. An HTTP-body consumer accepting the native
+terminal is the delivery boundary, not an acknowledgement from a remote client.
+Missing usage stays absent; this path does not synthesize provider usage.
+
+A configured loopback Chat endpoint can point at a local model server. This does
+not enable the special `local` redirect, download/start a model, or qualify the
+bundled llama-server lifecycle. `--no-local-model` remains the way to run the
+router with only configured endpoints. Native Messages sessions, explicit replay,
+and ordinary non-ARC routes keep their existing behavior; explicit replay cannot
+dispatch to a prepared Chat endpoint. Responses ingress and durable codec-stream
+restart are not supported by this mode. The private service and codec are
+operator-managed dependencies and are not included in the public repository.

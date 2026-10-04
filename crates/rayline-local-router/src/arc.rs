@@ -18,7 +18,7 @@ const RESPONSE_SCHEMA: &str = "rayline.arc.policy-decision-response.v1";
 #[serde(deny_unknown_fields)]
 pub struct ArcBinding {
     pub target: RouteTarget,
-    /// Exact Messages fields for the action's thinking semantics. Empty is explicit.
+    /// Native worker controls in the endpoint's format. Empty is explicit.
     pub request_overrides: serde_json::Map<String, Value>,
 }
 
@@ -85,15 +85,28 @@ impl ArcConfig {
                     .endpoints
                     .iter()
                     .any(|endpoint| endpoint.id == binding.target.endpoint
-                        && endpoint.protocol == crate::EndpointProtocol::AnthropicMessages),
-                "ARC action requires an anthropic_messages endpoint"
+                        && (endpoint.protocol == crate::EndpointProtocol::AnthropicMessages
+                            || (endpoint.protocol == crate::EndpointProtocol::OpenAIChat
+                                && self
+                                    .session
+                                    .as_ref()
+                                    .is_some_and(|s| s.codec_sha256.is_some())))),
+                "ARC Chat endpoints require opt-in session codec; otherwise native Messages required"
             );
+            let chat = config.endpoints.iter().any(|endpoint| {
+                endpoint.id == binding.target.endpoint
+                    && endpoint.protocol == crate::EndpointProtocol::OpenAIChat
+            });
             ensure!(
-                binding
-                    .request_overrides
-                    .keys()
-                    .all(|key| matches!(key.as_str(), "thinking" | "output_config")),
-                "ARC action overrides may only set thinking and output_config"
+                binding.request_overrides.keys().all(|key| if chat {
+                    matches!(
+                        key.as_str(),
+                        "reasoning_effort" | "reasoning" | "chat_template_kwargs"
+                    )
+                } else {
+                    matches!(key.as_str(), "thinking" | "output_config")
+                }),
+                "ARC worker controls must match its configured provider format"
             );
         }
         Ok(())
@@ -229,6 +242,15 @@ pub(crate) async fn route(state: &AppState, body: &mut Value) -> Result<RouteDec
         .bindings
         .get(selected)
         .ok_or_else(|| anyhow!("ARC binding missing"))?;
+    ensure!(
+        state
+            .config
+            .endpoints
+            .iter()
+            .any(|e| e.id == binding.target.endpoint
+                && e.protocol == crate::EndpointProtocol::AnthropicMessages),
+        "ARC replay supports only native Messages endpoints"
+    );
     let object = body
         .as_object_mut()
         .ok_or_else(|| anyhow!("ARC request must be an object"))?;

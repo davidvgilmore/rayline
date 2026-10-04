@@ -17,6 +17,8 @@ use std::time::Duration;
 #[serde(deny_unknown_fields)]
 pub struct SessionConfig {
     pub base_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codec_sha256: Option<String>,
     pub timeout_ms: u64,
     pub max_response_bytes: usize,
     #[serde(skip)]
@@ -52,6 +54,12 @@ impl SessionConfig {
     }
     pub(crate) fn validate(&self, arc: &ArcConfig) -> Result<()> {
         self.url("prepare")?;
+        if let Some(pin) = &self.codec_sha256 {
+            ensure!(
+                pin.len() == 64 && pin.bytes().all(|c| c.is_ascii_hexdigit()),
+                "ARC codec pin must be SHA256"
+            );
+        }
         ensure!(
             self.timeout_ms > 0 && (1..=16 * 1024 * 1024).contains(&self.max_response_bytes),
             "ARC session timeout and bounded response size required"
@@ -69,7 +77,7 @@ impl SessionConfig {
         }
         Ok(())
     }
-    async fn call(&self, operation: &str, payload: &Value) -> Result<Value> {
+    pub(crate) async fn call(&self, operation: &str, payload: &Value) -> Result<Value> {
         let client = reqwest::Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
@@ -189,6 +197,7 @@ pub(crate) async fn prepare(
             .filter(|s| !s.is_empty())
             .ok_or_else(|| anyhow!("ARC session receipt missing token"))?
             .to_owned(),
+        codec: None,
         settled: false,
         accepted_output: None,
         saw_terminal_keyword: false,
@@ -205,10 +214,30 @@ pub(crate) async fn prepare(
     ensure!(
         receipt["owner_id"] == turn.owner
             && receipt["package_sha256"] == arc.package_sha256
-            && receipt["request_format"] == "anthropic_messages"
             && receipt["source_request_format"] == "anthropic_messages",
         "ARC session receipt identity mismatch"
     );
+    let endpoint = state
+        .config
+        .endpoints
+        .iter()
+        .find(|e| e.id == binding.target.endpoint)
+        .ok_or_else(|| anyhow!("ARC endpoint missing"))?;
+    let chat = endpoint.protocol == crate::EndpointProtocol::OpenAIChat;
+    if chat {
+        turn.codec = Some(crate::arc_chat::Codec::from_receipt(
+            &turn.config,
+            &turn.owner,
+            &turn.token,
+            &receipt,
+        )?);
+    } else {
+        ensure!(
+            receipt["request_format"] == "anthropic_messages"
+                && receipt.get("response_codec").is_none(),
+            "ARC native receipt format mismatch"
+        );
+    }
     ensure!(
         receipt["decision"]["package"]
             == json!({"alias":arc.package_alias,"package_sha256":arc.package_sha256})
@@ -236,33 +265,54 @@ pub(crate) async fn prepare(
         prepared["model"] == binding.target.model && prepared["messages"].is_array(),
         "ARC session provider model/history mismatch"
     );
-    for key in ["thinking", "output_config"] {
+    if chat {
         ensure!(
-            prepared.get(key) == binding.request_overrides.get(key),
-            "ARC session changed fixed worker {key}"
+            prepared
+                .get("stream")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+                == body.get("stream").and_then(Value::as_bool).unwrap_or(false),
+            "ARC prepared streaming mode changed"
         );
-    }
-    for (key, value) in body
-        .as_object()
-        .ok_or_else(|| anyhow!("Messages body must be an object"))?
-    {
-        if !matches!(
-            key.as_str(),
-            "model" | "messages" | "thinking" | "output_config"
-        ) {
+        for key in ["reasoning_effort", "reasoning", "chat_template_kwargs"] {
             ensure!(
-                prepared.get(key) == Some(value),
-                "ARC session changed non-steering field {key}"
+                prepared.get(key) == binding.request_overrides.get(key),
+                "ARC session changed fixed worker {key}"
             );
         }
-    }
-    ensure!(
-        prepared
+        ensure!(
+            prepared.get("thinking").is_none() && prepared.get("output_config").is_none(),
+            "ARC Chat contains native Messages controls"
+        );
+    } else {
+        for key in ["thinking", "output_config"] {
+            ensure!(
+                prepared.get(key) == binding.request_overrides.get(key),
+                "ARC session changed fixed worker {key}"
+            );
+        }
+        for (key, value) in body
             .as_object()
-            .is_some_and(|map| map.keys().all(|key| body.get(key).is_some()
-                || matches!(key.as_str(), "thinking" | "output_config"))),
-        "ARC session added unexpected request fields"
-    );
+            .ok_or_else(|| anyhow!("Messages body must be an object"))?
+        {
+            if !matches!(
+                key.as_str(),
+                "model" | "messages" | "thinking" | "output_config"
+            ) {
+                ensure!(
+                    prepared.get(key) == Some(value),
+                    "ARC session changed non-steering field {key}"
+                );
+            }
+        }
+        ensure!(
+            prepared
+                .as_object()
+                .is_some_and(|map| map.keys().all(|key| body.get(key).is_some()
+                    || matches!(key.as_str(), "thinking" | "output_config"))),
+            "ARC session added unexpected request fields"
+        );
+    }
     *body = prepared.clone();
     // Retain the guard through dispatch errors and response-body cancellation.
     turn.settled = false;
@@ -300,6 +350,7 @@ fn settlement_payload(owner: &str, token: &str, output: Option<Value>) -> Value 
 }
 
 pub(crate) struct Turn {
+    pub(crate) codec: Option<crate::arc_chat::Codec>,
     config: SessionConfig,
     owner: String,
     token: String,
@@ -592,6 +643,7 @@ mod tests {
     }
     fn turn(config: SessionConfig) -> Turn {
         Turn {
+            codec: None,
             config,
             owner: "synthetic-owner".into(),
             token: "synthetic-token".into(),
