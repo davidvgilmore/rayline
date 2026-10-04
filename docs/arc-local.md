@@ -156,6 +156,13 @@ The focused `arc_session` module implements the loopback transport contract:
   `thinking`/`output_config` values. Rayline requires those exact values in the
   prepared request and bypasses model-name thinking adaptation. Stage 2 steering
   remains private message text; it never changes these native controls.
+  The selected level and the effective instruction are distinct. The service
+  applies steering only at positions admitted by its pinned planner. For example,
+  if a Claude request ends with a system date message after the user prompt,
+  the planner may skip a selected `up` instruction because that tail is not
+  steerable. A later tool-result tail can admit a private user instruction after
+  the tool results. Inspect the receipt's effective level, emission and placement;
+  do not infer that every selected level was appended or replayed.
 * The response bytes and usage remain unchanged. Rayline observes a bounded
   copy, reconstructs native signed thinking and tool blocks, and sends `commit`
   only after a complete successful Messages body or terminal SSE response has
