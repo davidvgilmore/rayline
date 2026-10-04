@@ -208,10 +208,14 @@ pub(crate) async fn route(state: &AppState, body: &mut Value) -> Result<RouteDec
         context["request_format"] == "anthropic_messages",
         "ARC request format must be anthropic_messages"
     );
+    let projected = ["system", "tools", "messages"]
+        .into_iter()
+        .filter_map(|key| body.get(key).map(|value| (key.to_owned(), value.clone())))
+        .collect::<serde_json::Map<String, Value>>();
     context
         .as_object_mut()
         .ok_or_else(|| anyhow!("ARC context must be an object"))?
-        .insert("request".to_owned(), body.clone());
+        .insert("request".to_owned(), Value::Object(projected));
     let result = config.decide(&context).await?;
     let selected = result["decision"]["selected_action_id"]
         .as_str()
@@ -419,8 +423,8 @@ mod tests {
         assert!(observed.get("rayline_arc").is_none());
         let scored = worker_request.await.unwrap();
         assert_eq!(scored["attribution"], envelope["attribution"]);
-        assert_eq!(scored["request"]["messages"], request["messages"]);
-        assert!(scored["request"].get("rayline_arc").is_none());
+        assert_eq!(scored["request"], json!({"messages":request["messages"]}));
+        assert_eq!(observed["max_tokens"], 8);
         server.abort();
     }
 }
