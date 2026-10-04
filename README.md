@@ -60,7 +60,17 @@ Run it alongside a normal Claude Code session, in its own isolated config dir:
 rayline claude --local --isolated
 ```
 
-Check on the router, follow its logs, or stop it:
+For an operator-supplied ARC session runtime, use a fresh profile with direct
+local routing (see [ARC setup and limits](docs/arc-local.md)):
+
+```bash
+rayline claude --config /private/arc-router.json --via direct --fresh-profile /private/new-arc-session
+```
+
+This supervises an endpoint-only daemon for that client and stops it on exit.
+It does not install or qualify the ARC numerical worker.
+
+Check on the shared router, follow its logs, or stop it:
 
 ```bash
 rayline router status
@@ -106,7 +116,7 @@ only ever need `--local`** — the other two are advanced overrides.
 | Flag | Question it answers | Values | Default |
 | --- | --- | --- | --- |
 | `--local` | Who decides routing? | on-device router when present, hosted cloud router when absent | cloud |
-| `--via` | How does Claude Code connect? | `proxy`, `env` | `proxy` |
+| `--via` | How does Claude Code connect? | `proxy`, `env`, `direct` (ARC) | `proxy` |
 | `--route` | What flows through the router? | `all`, `subagents` | depends on router |
 
 - `--local` runs the on-device static router: no login, and routing decisions

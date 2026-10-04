@@ -29,6 +29,16 @@ config dir so the two don't interfere:
 rayline claude --local --isolated
 ```
 
+An operator-supplied ARC session runtime uses the direct Messages launcher:
+
+```bash
+rayline claude --config /private/arc-router.json --via direct --fresh-profile /private/new-arc-session
+```
+
+Unlike the shared-history `--isolated` overlay, this requires a new directory
+and supervises an endpoint-only daemon for the fresh client. It does not install
+the numerical worker. See [ARC configuration and qualification limits](arc-local.md).
+
 You can also start the router **without** launching Claude Code — handy when you
 want to drive it from your own code (for example an Anthropic SDK client pointed
 at the proxy on `http://127.0.0.1:20810`). It routes every request through the

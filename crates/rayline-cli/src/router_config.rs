@@ -105,7 +105,17 @@ pub fn config_needs_local_router(path: &Path) -> bool {
     config_value_needs_local_router(&cfg)
 }
 
+pub fn config_has_arc(path: &Path) -> bool {
+    std::fs::read(path)
+        .ok()
+        .and_then(|raw| serde_json::from_slice::<Value>(&raw).ok())
+        .is_some_and(|cfg| cfg.get("arc").is_some())
+}
+
 fn config_value_needs_local_router(cfg: &Value) -> bool {
+    if cfg.get("arc").is_some() {
+        return true;
+    }
     if config_value_uses_local_decider(cfg) {
         return true;
     }

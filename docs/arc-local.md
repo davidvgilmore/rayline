@@ -288,3 +288,45 @@ real-provider cache behavior or durable sessions. The service currently keeps
 state in memory. Resolve uncertain settlement before retrying; a restart or new
 session identity is not recovery. Responses ingress, managed numerical-worker
 lifecycle and launch readiness remain separate work.
+
+### Launch Claude Code with a fresh ARC profile
+
+For ordinary Claude Code interaction, use the explicit direct connection mode:
+
+```sh
+rayline claude --config /private/arc-router.json --via direct \
+  --fresh-profile /private/new-arc-session
+```
+
+The directory must be absolute and must not exist. This mode requires an ARC
+session configuration with named endpoint bindings. It selects `rayline-arc` for
+all requests and starts the installed `rld` with `--no-local-model`; it does not
+onboard or download a generator. Start the installed session runtime, numerical
+worker and generation endpoints separately using their qualified settings.
+A ready daemon does not establish their readiness or numerical parity.
+
+The launcher supervises both the daemon and Claude Code. Its foreground daemon
+uses private data, configuration and logs under the new directory and dynamically
+allocated loopback ports. Claude receives a fresh configuration, empty settings
+and MCP configuration, no inherited customizations, and a process-local server
+URL. Provider credentials referenced by endpoint `api_key_env` remain available
+only to the daemon; Claude receives a nonsecret local placeholder. This path
+uses no interception proxy, CA registration, OAuth login, browser launch, or
+shared daemon registry. The fresh client disables the background agent view;
+its lifetime belongs to this foreground launch. It keeps the caller's working
+directory and HOME.
+
+Exit Claude or interrupt the launcher to stop its owned daemon and client
+processes. The private directory and logs remain for inspection. Each launch
+requires a new directory; resume/continue and client overrides that would select
+another model or shared settings are refused. This is a fresh conversation,
+not recovery of an uncertain ARC settlement. Inspect and resolve the service's
+state before retrying an ambiguous outcome.
+
+`--isolated` retains its existing shared-history overlay behavior and cannot be
+combined with `--fresh-profile`. `--via env` remains cloud-only. ARC client
+launches through other modes are refused with guidance rather than triggering
+generator onboarding, hosted routing, or a shared-profile proxy. The Codex
+launcher and Codex desktop use Responses and remain outside this Messages-only
+integration. Source and synthetic tests do not establish real-client or numerical
+acceptance; qualify the exact installed launcher/runtime before relying on it.
