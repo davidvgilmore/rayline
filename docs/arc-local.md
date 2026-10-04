@@ -43,7 +43,19 @@ an external local configuration, never by committing them here.
 ```
 
 ```sh
-cargo run -p rayline-local-router --locked --example arc-router -- /private/config.json 20811
+cargo build --locked -p rayline-cli -p rayline-daemon
+./target/debug/rld serve --no-local-model --router-config-path /private/config.json
+```
+
+This uses the ordinary foreground daemon and its `/v1/messages` endpoint on
+port 20811. Stop it with Ctrl-C. `--no-local-model` skips the bundled generation
+model; the separately managed ARC worker and configured provider endpoints must
+already be running. Successful daemon startup does not establish worker readiness
+or model parity; a worker failure is returned on the ARC request.
+
+For decision-only replay during integration development:
+
+```sh
 cargo run -p rayline-local-router --locked --example arc-replay -- /private/config.json /private/requests.jsonl > /private/decisions.jsonl
 ```
 
@@ -88,7 +100,7 @@ A release acceptance run must independently establish all of these:
 2. Replay the same reference decide envelopes, including sequential held turns,
    attributed history, masks and compaction. Compare exact action and arm IDs,
    and numerical scores under tolerances fixed before evaluating the candidate.
-3. Drive those contexts through `arc-router`; capture worker requests and a local
+3. Drive those contexts through `rld serve`; capture worker requests and a local
    recording provider's model/thinking fields. Establish the same decisions and
    dispatch semantics without paid provider calls.
 4. Exercise unavailable worker, package mismatch and ineligible decision errors;
@@ -98,3 +110,11 @@ A golden-only match does not establish VSR-Lab parity unless the reference
 engine, package, inputs and non-token state are the same. Automatic episode
 tracking, managed runtime installation and general client launch integration are
 subsequent work, not properties established by this experimental adapter.
+
+Rayline's product surfaces are its CLI and daemon, including launchers for
+external desktop clients. `rayline codex app` is a Codex desktop launcher; it
+does not establish ARC support for Codex's Responses API. Normal Claude/Codex
+launch flows cannot yet create the explicit ARC context above automatically.
+Completing that integration requires host-owned conversation identity, response
+attribution and retry/compaction handling, plus worker lifecycle and actionable
+setup errors. Ordinary users should not have to construct replay envelopes.
