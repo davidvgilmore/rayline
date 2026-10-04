@@ -175,9 +175,10 @@ worker selection on retries, and keep private text outside the client-visible
 history. Its response is trusted for ledger placement; numerical inference,
 planner semantics and pinned trained-arm membership remain service-owned.
 This adapter does not bundle or supervise that service. The private reference
-implementation is not included in this repository. A distributable session
-service, clean installation, Responses API support, explicit compaction events,
-and real on-device encoder parity remain unqualified.
+implementation is not included in this repository. Qualify its exact supplied
+artifact and settings using the setup below. Responses API
+support, explicit compaction events and real on-device encoder parity remain
+separate acceptance requirements.
 
 Synthetic tests now compose two ordinary HTTP requests through Rayline, a mock
 session service and a mock provider. They verify native session identity,
@@ -244,3 +245,46 @@ and ordinary non-ARC routes keep their existing behavior; explicit replay cannot
 dispatch to a prepared Chat endpoint. Responses ingress and durable codec-stream
 restart are not supported by this mode. The private service and codec are
 operator-managed dependencies and are not included in the public repository.
+
+### Use an installed session runtime
+
+The ARC session service is an operator-managed dependency. If your deployment
+supplies its bundle, install the pinned artifact into a new private directory.
+Keep the package manifest, provider settings and complete action catalog outside
+this repository. The bundle contains no numerical encoder, heads, model weights
+or provider credentials; its separate policy endpoint must already be running.
+
+Use unused ports and isolated runtime/server configuration when testing beside
+existing agent sessions. These steps require no global client settings changes.
+
+Set `ARC_RUNTIME` to the installation directory and the other variables below
+to your private settings file, package manifest and package alias. Obtain the
+settings-bound codec pin from the installed launcher:
+
+```sh
+"$ARC_RUNTIME/arc-session" --settings "$ARC_SETTINGS" --package "$ARC_PACKAGE" \
+  --package-alias "$ARC_PACKAGE_ALIAS" --describe-config
+```
+
+Set `arc.session.codec_sha256` to that result. It identifies the codec plus
+provider/backend profiles, not only a binary. Start the same launcher and settings
+with `--policy-endpoint http://127.0.0.1:9012/v1/rayline/arc/policy/decide --port 9013`.
+Set `arc.session.base_url` to the origin `http://127.0.0.1:9013`; Rayline adds the
+session operation paths. Then start the normal `rld serve --no-local-model
+--router-config-path /private/router.json`. This does not download or start the
+numerical worker or generation endpoints. Use a fresh daemon/config directory
+when testing alongside existing agent sessions.
+
+Keep the complete action basket and exact endpoint/model bindings. Fixed native
+controls come from the selected release, not an effort label. A llama usage
+profile must bind the actual backend revision and executable identity, including
+its response model alias. Generic Chat providers can require final accounting
+before emitting a translated response, and incomplete cache partitions can be
+refused. Unknown usage stays unknown; one profile is not a promise of universal
+provider streaming or cache support.
+
+Installation and synthetic transport checks do not establish numeric ARC parity,
+real-provider cache behavior or durable sessions. The service currently keeps
+state in memory. Resolve uncertain settlement before retrying; a restart or new
+session identity is not recovery. Responses ingress, managed numerical-worker
+lifecycle and launch readiness remain separate work.
