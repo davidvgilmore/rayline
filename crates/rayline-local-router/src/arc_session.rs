@@ -132,6 +132,50 @@ fn native_identity(headers: &HeaderMap, body: &Value) -> Result<Value> {
     )
 }
 
+fn validate_native_prepared(
+    body: &Value,
+    prepared: &Value,
+    controls: &serde_json::Map<String, Value>,
+) -> Result<()> {
+    // The Messages codec makes the provider default explicit when tools exist.
+    // An explicit choice, extra choice fields, or requests without tools are not equivalent.
+    let default_tool_choice = body.get("tool_choice").is_none()
+        && body
+            .get("tools")
+            .and_then(Value::as_array)
+            .is_some_and(|tools| !tools.is_empty())
+        && prepared.get("tool_choice") == Some(&json!({"type": "auto"}));
+    for key in ["thinking", "output_config"] {
+        ensure!(
+            prepared.get(key) == controls.get(key),
+            "ARC session changed fixed worker {key}"
+        );
+    }
+    for (key, value) in body
+        .as_object()
+        .ok_or_else(|| anyhow!("Messages body must be an object"))?
+    {
+        if !matches!(
+            key.as_str(),
+            "model" | "messages" | "thinking" | "output_config"
+        ) {
+            ensure!(
+                prepared.get(key) == Some(value),
+                "ARC session changed non-steering field {key}"
+            );
+        }
+    }
+    ensure!(
+        prepared
+            .as_object()
+            .is_some_and(|map| map.keys().all(|key| body.get(key).is_some()
+                || matches!(key.as_str(), "thinking" | "output_config")
+                || (key == "tool_choice" && default_tool_choice))),
+        "ARC session added unexpected request fields"
+    );
+    Ok(())
+}
+
 pub(crate) async fn prepare(
     state: &AppState,
     headers: &HeaderMap,
@@ -285,33 +329,7 @@ pub(crate) async fn prepare(
             "ARC Chat contains native Messages controls"
         );
     } else {
-        for key in ["thinking", "output_config"] {
-            ensure!(
-                prepared.get(key) == binding.request_overrides.get(key),
-                "ARC session changed fixed worker {key}"
-            );
-        }
-        for (key, value) in body
-            .as_object()
-            .ok_or_else(|| anyhow!("Messages body must be an object"))?
-        {
-            if !matches!(
-                key.as_str(),
-                "model" | "messages" | "thinking" | "output_config"
-            ) {
-                ensure!(
-                    prepared.get(key) == Some(value),
-                    "ARC session changed non-steering field {key}"
-                );
-            }
-        }
-        ensure!(
-            prepared
-                .as_object()
-                .is_some_and(|map| map.keys().all(|key| body.get(key).is_some()
-                    || matches!(key.as_str(), "thinking" | "output_config"))),
-            "ARC session added unexpected request fields"
-        );
+        validate_native_prepared(body, prepared, &binding.request_overrides)?;
     }
     *body = prepared.clone();
     // Retain the guard through dispatch errors and response-body cancellation.
@@ -677,6 +695,44 @@ mod tests {
         assert_eq!(identity["session_id"], "native-session");
         assert_eq!(identity["agent_id"], "child");
     }
+    #[test]
+    fn native_tool_choice_default_is_narrowly_equivalent() {
+        let body = json!({"model":"arc","messages":[],"tools":[{"name":"read"}]});
+        let mut prepared = body.clone();
+        prepared["model"] = json!("worker");
+        prepared["tool_choice"] = json!({"type":"auto"});
+        assert!(validate_native_prepared(&body, &prepared, &serde_json::Map::new()).is_ok());
+        for invalid in [
+            json!({"type":"any"}),
+            json!({"type":"none"}),
+            json!({"type":"auto","disable_parallel_tool_use":true}),
+        ] {
+            let mut changed = prepared.clone();
+            changed["tool_choice"] = invalid;
+            assert!(validate_native_prepared(&body, &changed, &serde_json::Map::new()).is_err());
+        }
+        for tools in [None, Some(json!([]))] {
+            let mut source = body.clone();
+            let mut target = prepared.clone();
+            source.as_object_mut().unwrap().remove("tools");
+            target.as_object_mut().unwrap().remove("tools");
+            if let Some(tools) = tools {
+                source["tools"] = tools.clone();
+                target["tools"] = tools;
+            }
+            assert!(validate_native_prepared(&source, &target, &serde_json::Map::new()).is_err());
+        }
+        let mut explicit = body.clone();
+        explicit["tool_choice"] = json!({"type":"none"});
+        assert!(validate_native_prepared(&explicit, &prepared, &serde_json::Map::new()).is_err());
+        let mut extra = prepared.clone();
+        extra["temperature"] = json!(1);
+        assert!(validate_native_prepared(&body, &extra, &serde_json::Map::new()).is_err());
+        let mut control = prepared.clone();
+        control["thinking"] = json!({"type":"adaptive"});
+        assert!(validate_native_prepared(&body, &control, &serde_json::Map::new()).is_err());
+    }
+
     #[tokio::test]
     async fn exact_native_output_commits_only_after_complete_body_consumption() {
         let (config, requests, server) = service().await;
@@ -851,6 +907,7 @@ mod tests {
             // This fixed native control deliberately differs from the ordinary
             // model-name adaptation; session dispatch must preserve it exactly.
             provider["thinking"]=json!({"type":"enabled","budget_tokens":2048});
+            provider["tool_choice"]=json!({"type":"auto"});
             let last=provider["messages"].as_array_mut().unwrap().last_mut().unwrap();
             if let Some(text)=last["content"].as_str(){last["content"]=json!([{"type":"text","text":text}]);}
             last["content"].as_array_mut().unwrap().push(json!({"type":"text","text":"synthetic private tail"}));
@@ -900,7 +957,7 @@ mod tests {
         });
         let mut messages = json!([{"role":"user","content":"read synthetic file"}]);
         for turn_index in 0..2 {
-            let request = json!({"model":"rayline-arc","max_tokens":16,"metadata":{"user_id":"{\"session_id\":\"synthetic-native\"}"},"messages":messages});
+            let request = json!({"tools":[{"name":"read","input_schema":{"type":"object"}}],"model":"rayline-arc","max_tokens":16,"metadata":{"user_id":"{\"session_id\":\"synthetic-native\"}"},"messages":messages});
             let response = reqwest::Client::new()
                 .post(format!("http://{address}/v1/messages"))
                 .json(&request)
@@ -968,6 +1025,7 @@ mod tests {
         );
         let provider = provider_requests.lock().unwrap();
         assert_eq!(provider.len(), 2);
+        assert_eq!(provider[0]["tool_choice"], json!({"type":"auto"}));
         assert_eq!(
             provider[0]["thinking"],
             json!({"type":"enabled","budget_tokens":2048})
