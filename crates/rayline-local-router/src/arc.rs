@@ -25,6 +25,8 @@ pub struct ArcBinding {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ArcConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<crate::arc_session::SessionConfig>,
     pub base_url: String,
     pub package_alias: String,
     pub package_sha256: String,
@@ -54,6 +56,9 @@ impl ArcConfig {
 
     pub(crate) fn validate(&self, config: &RouterConfig) -> Result<()> {
         self.url()?;
+        if let Some(session) = &self.session {
+            session.validate(self)?;
+        }
         ensure!(self.timeout_ms > 0, "ARC timeout must be positive");
         ensure!(
             !self.package_alias.is_empty()
@@ -141,7 +146,7 @@ impl ArcConfig {
         Ok(result)
     }
 
-    fn validate_response(&self, envelope: &Value, result: &Value) -> Result<()> {
+    pub(crate) fn validate_response(&self, envelope: &Value, result: &Value) -> Result<()> {
         ensure!(
             result["schema_version"] == RESPONSE_SCHEMA,
             "ARC response schema mismatch"
@@ -255,6 +260,7 @@ mod tests {
             "http://user@127.0.0.1",
         ] {
             let config = ArcConfig {
+                session: None,
                 base_url: origin.into(),
                 package_alias: "test".into(),
                 package_sha256: "a".repeat(64),
@@ -304,6 +310,7 @@ mod tests {
     fn setup(base_url: String) -> (ArcConfig, Value, Value) {
         use serde_json::json;
         let config = ArcConfig {
+            session: None,
             base_url,
             package_alias: "synthetic".into(),
             package_sha256: "a".repeat(64),

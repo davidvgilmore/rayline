@@ -6,6 +6,7 @@
 //! provider endpoints, and local-model redirects.
 
 pub mod arc;
+pub mod arc_session;
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -1149,8 +1150,21 @@ async fn handle_messages(state: AppState, req: Request<Incoming>) -> Result<Resp
     let headers = req.headers().clone();
     let mut body = req.into_body().collect().await?.to_bytes();
     let mut parsed = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
+    let mut session_turn = None;
     let decision = if parsed.get("model").and_then(Value::as_str) == Some(arc::VIRTUAL_MODEL) {
-        let decision = arc::route(&state, &mut parsed).await?;
+        let decision = if parsed.get("rayline_arc").is_none()
+            && state
+                .config
+                .arc
+                .as_ref()
+                .is_some_and(|arc| arc.session.is_some())
+        {
+            let (decision, turn) = arc_session::prepare(&state, &headers, &mut parsed).await?;
+            session_turn = Some(turn);
+            decision
+        } else {
+            arc::route(&state, &mut parsed).await?
+        };
         body = Bytes::from(serde_json::to_vec(&parsed)?);
         decision
     } else {
@@ -1250,7 +1264,10 @@ async fn handle_messages(state: AppState, req: Request<Incoming>) -> Result<Resp
             if let Err(error) = response.as_ref() {
                 record_request_error(state.opts.metrics.as_ref(), &request_id, None, error);
             }
-            response
+            match (response, session_turn) {
+                (Ok(response), Some(turn)) => Ok(turn.observe(response)),
+                (response, _) => response,
+            }
         }
     }
 }
@@ -2573,7 +2590,9 @@ async fn forward_anthropic_endpoint(
 ) -> Result<Response<BoxBody>> {
     let mut parsed = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
     rewrite_body_model(&mut parsed, &decision.selected_model);
-    adapt_anthropic_body_for_model(&mut parsed, &decision.selected_model);
+    if decision.policy != "arc_session" {
+        adapt_anthropic_body_for_model(&mut parsed, &decision.selected_model);
+    }
     let outbound_body = serde_json::to_vec(&parsed).unwrap_or_else(|_| body.to_vec());
     let url = format!("{}/v1/messages", endpoint.base_url.trim_end_matches('/'));
     let mut outbound = state
@@ -2872,6 +2891,7 @@ async fn response_from_reqwest(
     // Prefer the upstream-reported model (native passthrough) over the sentinel.
     let selected_model =
         prefer_upstream_selected_model(upstream_selected_model.as_deref(), decision);
+    let cancel_on_disconnect = decision.is_some_and(|decision| decision.policy == "arc_session");
     // Body accumulation is only needed for end-of-stream usage extraction when metrics are active.
     // Mirror the proxy's observe_response gate so large responses are not buffered unnecessarily.
     let has_metrics = metrics.is_some() && request_id.is_some();
@@ -2893,7 +2913,15 @@ async fn response_from_reqwest(
             output_tokens,
             selected_model.clone(),
         );
-        while let Some(chunk) = stream.next().await {
+        loop {
+            let next = if cancel_on_disconnect {
+                tokio::select! { biased; _ = tx.closed() => break, next = stream.next() => next }
+            } else {
+                stream.next().await
+            };
+            let Some(chunk) = next else {
+                break;
+            };
             match chunk {
                 Ok(bytes) => {
                     if !saw_first_token {
@@ -2929,6 +2957,9 @@ async fn response_from_reqwest(
                     retain_for_metrics(has_metrics, &mut body, &bytes);
                     if downstream_open && tx.send(Ok(Frame::data(bytes))).await.is_err() {
                         downstream_open = false;
+                        if cancel_on_disconnect {
+                            break;
+                        }
                     }
                 }
                 Err(error) => {
