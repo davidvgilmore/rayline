@@ -5,6 +5,8 @@
 //! OSS-shaped milestone local/client-side only: static rules, configured
 //! provider endpoints, and local-model redirects.
 
+pub mod arc;
+
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::fs;
@@ -79,6 +81,9 @@ impl Default for LocalRouterOptions {
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct RouterConfig {
+    /// Experimental local ARC worker and explicit action bindings.
+    #[serde(default)]
+    pub arc: Option<arc::ArcConfig>,
     #[serde(default)]
     pub endpoints: Vec<EndpointConfig>,
     #[serde(default)]
@@ -333,6 +338,9 @@ fn load_config(opts: &LocalRouterOptions) -> Result<RouterConfig> {
 }
 
 fn merge_config(config: &mut RouterConfig, overrides: RouterConfig) {
+    if overrides.arc.is_some() {
+        config.arc = overrides.arc;
+    }
     for endpoint in overrides.endpoints {
         if let Some(existing) = config
             .endpoints
@@ -372,6 +380,9 @@ fn merge_config(config: &mut RouterConfig, overrides: RouterConfig) {
 }
 
 fn normalize_config(config: &mut RouterConfig, local_model_id: &str) -> Result<()> {
+    if let Some(arc) = &config.arc {
+        arc.validate(config)?;
+    }
     for endpoint in &config.endpoints {
         validate_endpoint(endpoint)?;
         if endpoint_hidden_from_catalog(endpoint) {
@@ -462,6 +473,7 @@ fn normalize_route_target(route: &mut RouteTarget, local_model_id: &str) -> Resu
 
 fn default_config(local_model_id: &str) -> RouterConfig {
     RouterConfig {
+        arc: None,
         endpoints: vec![
             EndpointConfig {
                 id: "anthropic".to_owned(),
@@ -1135,9 +1147,20 @@ async fn count_responses_tokens_response(req: Request<Incoming>) -> Response<Box
 async fn handle_messages(state: AppState, req: Request<Incoming>) -> Result<Response<BoxBody>> {
     let t_start = Instant::now();
     let headers = req.headers().clone();
-    let body = req.into_body().collect().await?.to_bytes();
-    let parsed = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
-    let decision = select_route_with_warn(&state, &headers, &parsed, ApiSurface::Anthropic);
+    let mut body = req.into_body().collect().await?.to_bytes();
+    let mut parsed = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
+    let decision = if parsed.get("model").and_then(Value::as_str) == Some(arc::VIRTUAL_MODEL) {
+        let decision = arc::route(&state, &mut parsed).await?;
+        body = Bytes::from(serde_json::to_vec(&parsed)?);
+        decision
+    } else {
+        if parsed.get("rayline_arc").is_some() {
+            return Err(anyhow!(
+                "rayline_arc context requires the rayline-arc virtual model"
+            ));
+        }
+        select_route_with_warn(&state, &headers, &parsed, ApiSurface::Anthropic)
+    };
     let request_id = headers
         .get(REQUEST_ID_HEADER)
         .and_then(header_str)
@@ -1237,6 +1260,13 @@ async fn handle_responses(state: AppState, req: Request<Incoming>) -> Result<Res
     let headers = req.headers().clone();
     let body = req.into_body().collect().await?.to_bytes();
     let parsed = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
+    if parsed.get("model").and_then(Value::as_str) == Some(arc::VIRTUAL_MODEL)
+        || parsed.get("rayline_arc").is_some()
+    {
+        return Err(anyhow!(
+            "experimental ARC routing currently requires /v1/messages"
+        ));
+    }
     let decision = select_route_with_warn(&state, &headers, &parsed, ApiSurface::Codex);
     let request_id = request_id_from_headers(&headers);
     let output_kind = responses_output_kind(&parsed);
@@ -1345,6 +1375,13 @@ async fn handle_openai_passthrough_family(
     let headers = req.headers().clone();
     let body = req.into_body().collect().await?.to_bytes();
     let parsed = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
+    if parsed.get("model").and_then(Value::as_str) == Some(arc::VIRTUAL_MODEL)
+        || parsed.get("rayline_arc").is_some()
+    {
+        return Err(anyhow!(
+            "experimental ARC routing currently requires /v1/messages"
+        ));
+    }
     let decision = select_route_with_warn(&state, &headers, &parsed, ApiSurface::Codex);
     let request_id = request_id_from_headers(&headers);
     forward_openai_family_or_unsupported(
@@ -1376,6 +1413,13 @@ async fn handle_openai_auxiliary(
     let headers = req.headers().clone();
     let body = req.into_body().collect().await?.to_bytes();
     let parsed = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
+    if parsed.get("model").and_then(Value::as_str) == Some(arc::VIRTUAL_MODEL)
+        || parsed.get("rayline_arc").is_some()
+    {
+        return Err(anyhow!(
+            "experimental ARC routing currently requires /v1/messages"
+        ));
+    }
     let decision = select_route_with_warn(&state, &headers, &parsed, ApiSurface::Codex);
     let request_id = request_id_from_headers(&headers);
 
