@@ -160,7 +160,9 @@ fn validate_native_prepared(
             "model" | "messages" | "thinking" | "output_config"
         ) {
             ensure!(
-                prepared.get(key) == Some(value),
+                prepared.get(key) == Some(value)
+                    // The pinned Messages codec omits the false default.
+                    || (key == "stream" && value == &Value::Bool(false) && prepared.get(key).is_none()),
                 "ARC session changed non-steering field {key}"
             );
         }
@@ -896,6 +898,23 @@ mod tests {
         });
         (format!("http://{address}"), task)
     }
+    #[test]
+    fn native_codec_omits_false_stream_but_never_changes_true_or_null() {
+        let body = json!({"model":"arc","messages":[],"stream":false});
+        let prepared = json!({"model":"provider","messages":[]});
+        assert!(validate_native_prepared(&body, &prepared, &serde_json::Map::new()).is_ok());
+        for value in [json!(true), Value::Null, json!("false")] {
+            let mut changed = body.clone();
+            changed["stream"] = value;
+            assert!(
+                validate_native_prepared(&changed, &prepared, &serde_json::Map::new()).is_err()
+            );
+        }
+        let mut changed = prepared.clone();
+        changed["stream"] = json!(true);
+        assert!(validate_native_prepared(&body, &changed, &serde_json::Map::new()).is_err());
+    }
+
     #[tokio::test]
     async fn two_native_http_turns_compose_prepare_private_tool_tail_dispatch_and_commit() {
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -904,6 +923,7 @@ mod tests {
             seen.lock().unwrap().push((path.clone(),input.clone()));
             if !path.ends_with("prepare") {return json!({"state":if path.ends_with("commit"){"committed"}else{"aborted"}});}
             let mut provider=input["request"].clone();provider["model"]=json!("claude-sonnet-5");
+            provider.as_object_mut().unwrap().remove("stream");
             // This fixed native control deliberately differs from the ordinary
             // model-name adaptation; session dispatch must preserve it exactly.
             provider["thinking"]=json!({"type":"enabled","budget_tokens":2048});
@@ -957,7 +977,7 @@ mod tests {
         });
         let mut messages = json!([{"role":"user","content":"read synthetic file"}]);
         for turn_index in 0..2 {
-            let request = json!({"tools":[{"name":"read","input_schema":{"type":"object"}}],"model":"rayline-arc","max_tokens":16,"metadata":{"user_id":"{\"session_id\":\"synthetic-native\"}"},"messages":messages});
+            let request = json!({"tools":[{"name":"read","input_schema":{"type":"object"}}],"model":"rayline-arc","max_tokens":16,"stream":false,"metadata":{"user_id":"{\"session_id\":\"synthetic-native\"}"},"messages":messages});
             let response = reqwest::Client::new()
                 .post(format!("http://{address}/v1/messages"))
                 .json(&request)
@@ -986,31 +1006,35 @@ mod tests {
             .unwrap();
             messages.as_array_mut().unwrap().extend([json!({"role":"assistant","content":response["content"]}),json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"tool-a","content":"synthetic result","cache_control":{"type":"ephemeral"}}]})]);
         }
-        let invalid = json!({"model":"rayline-arc","max_tokens":17,"metadata":{"user_id":"{\"session_id\":\"synthetic-native\"}"},"messages":messages});
-        let response = reqwest::Client::new()
-            .post(format!("http://{address}/v1/messages"))
-            .json(&invalid)
-            .send()
+        for (index, max_tokens) in [17, 18].into_iter().enumerate() {
+            let invalid = json!({"model":"rayline-arc","max_tokens":max_tokens,"stream":true,"metadata":{"user_id":"{\"session_id\":\"synthetic-native\"}"},"messages":messages});
+            let response = reqwest::Client::new()
+                .post(format!("http://{address}/v1/messages"))
+                .json(&invalid)
+                .send()
+                .await
+                .unwrap();
+            assert!(!response.status().is_success());
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if requests
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|(p, _)| p.ends_with("abort"))
+                        .count()
+                        == index + 1
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
             .await
             .unwrap();
-        assert!(!response.status().is_success());
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                if requests
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .any(|(p, _)| p.ends_with("abort"))
-                {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
+        }
         let requests = requests.lock().unwrap();
-        assert_eq!(requests.len(), 6);
+        assert_eq!(requests.len(), 8);
         assert_eq!(requests[0].1["owner_id"], requests[2].1["owner_id"]);
         assert_ne!(requests[0].1["operation_id"], requests[2].1["operation_id"]);
         assert_eq!(requests[0].1["metadata"]["session_id"], "synthetic-native");
