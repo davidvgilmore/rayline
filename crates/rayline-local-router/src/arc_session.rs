@@ -537,6 +537,7 @@ fn completed_output(bytes: &[u8], sse: bool) -> Result<Value> {
     let mut blocks: Vec<Value> = Vec::new();
     let mut started = false;
     let mut stopped = false;
+    let mut done = false;
     let mut closed = true;
     let mut stop_reason = false;
     let mut tool_json = String::new();
@@ -547,6 +548,11 @@ fn completed_output(bytes: &[u8], sse: bool) -> Result<Value> {
             .collect::<Vec<_>>()
             .join("\n");
         if data.is_empty() {
+            continue;
+        }
+        if data == "[DONE]" {
+            ensure!(stopped && !done, "unexpected native completion marker");
+            done = true;
             continue;
         }
         let value: Value = serde_json::from_str(&data)?;
@@ -1063,6 +1069,92 @@ mod tests {
         provider_task.abort();
         service_task.abort();
     }
+    #[test]
+    fn optional_native_done_requires_valid_terminal_and_is_unique() {
+        let native = events();
+        let expected = completed_output(native.as_bytes(), true).unwrap();
+        for trailer in ["data: [DONE]\n\n", "event: data\r\ndata:[DONE]\r\n\r\n"] {
+            let wire = format!("{native}{trailer}");
+            assert_eq!(completed_output(wire.as_bytes(), true).unwrap(), expected);
+            assert!(completed_output(format!("{wire}{trailer}").as_bytes(), true).is_err());
+            assert!(
+                completed_output(
+                    format!("{wire}data: {{\"type\":\"ping\"}}\n\n").as_bytes(),
+                    true
+                )
+                .is_err()
+            );
+            assert!(completed_output(format!("{trailer}{native}").as_bytes(), true).is_err());
+        }
+        assert!(completed_output(b"data: [DONE]\n\n", true).is_err());
+    }
+
+    #[tokio::test]
+    async fn native_sentinel_chunking_preserves_output_and_settles_once() {
+        let native = events();
+        let wire = format!("{native}event: data\ndata: [DONE]\n\n");
+        let split = wire.find("message_stop").unwrap() + 5;
+        let cases = [
+            (vec![wire.clone()], true),
+            (
+                vec![wire[..split].to_owned(), wire[split..].to_owned()],
+                true,
+            ),
+            (vec![format!("data: [DONE]\n\n{native}")], false),
+            (vec![format!("{wire}data: [DONE]\n\n")], false),
+            (
+                vec![format!(
+                    "{wire}data: {{\"type\":\"content_block_delta\"}}\n\n"
+                )],
+                false,
+            ),
+        ];
+        for (chunks, success) in cases {
+            let (config, requests, server) = service().await;
+            let expected_bytes = chunks.concat();
+            let frames = stream::iter(
+                chunks
+                    .into_iter()
+                    .map(|chunk| Ok::<_, std::io::Error>(Frame::data(Bytes::from(chunk)))),
+            );
+            let mut response = Response::new(BodyExt::boxed(StreamBody::new(frames)));
+            response
+                .headers_mut()
+                .insert("content-type", "text/event-stream".parse().unwrap());
+            let mut body = turn(config).observe(response).into_body();
+            let mut delivered = Vec::new();
+            let mut failed = false;
+            while let Some(frame) = body.frame().await {
+                match frame {
+                    Ok(frame) => {
+                        if let Some(bytes) = frame.data_ref() {
+                            delivered.extend_from_slice(bytes);
+                        }
+                    }
+                    Err(_) => failed = true,
+                }
+            }
+            assert_eq!(delivered, expected_bytes.as_bytes());
+            assert_eq!(failed, !success);
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            assert!(
+                requests[0]
+                    .0
+                    .ends_with(if success { "commit" } else { "abort" })
+            );
+            if success {
+                assert_eq!(
+                    requests[0].1["response_messages"],
+                    completed_output(native.as_bytes(), true).unwrap()
+                );
+            } else {
+                assert!(requests[0].1.get("response_messages").is_none());
+            }
+            server.abort();
+        }
+    }
+
     #[tokio::test]
     async fn terminal_frame_then_drop_commits_without_waiting_for_eof() {
         let (config, requests, server) = service().await;
