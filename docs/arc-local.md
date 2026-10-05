@@ -330,6 +330,22 @@ positive decimal `u64` integer before creating the profile or starting processes
 and forwards it only to Claude. Unset leaves Claude's default unchanged; invalid,
 zero or overflowing values fail clearly. Model/provider limits still apply.
 
+For a custom route such as `rayline-arc`, you can also explicitly set
+`CLAUDE_CODE_MAX_CONTEXT_TOKENS` to the deployment's client context budget.
+Direct mode validates the same positive decimal integer format and forwards it
+only to Claude; omission keeps Claude's default. This informs the client's
+context handling without mapping the route to another model or changing native
+thinking controls. An unknown-model warning's assumed window is not an ARC
+capacity claim.
+
+The current native development encoder has a separate hard limit of 16,384
+projection tokens and refuses oversized input without truncation. Claude and
+ARC use different tokenizers and message framing, so a client budget of 16,384
+does not guarantee that the ARC projection fits. Leave deployment-appropriate
+margin; automatic compaction at that boundary has not been qualified. The
+encoder's declared package capacity and a cloud model's context window do not
+override this operational limit.
+
 Exit Claude or interrupt the launcher to stop its owned daemon and client
 processes. The private directory and logs remain for inspection. Each launch
 requires a new directory; resume/continue and client overrides that would select

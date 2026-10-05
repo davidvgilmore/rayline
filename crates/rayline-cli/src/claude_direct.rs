@@ -8,6 +8,7 @@ use std::time::Duration;
 use crate::claude::RunRequest;
 
 const MAX_OUTPUT_TOKENS_ENV: &str = "CLAUDE_CODE_MAX_OUTPUT_TOKENS";
+const MAX_CONTEXT_TOKENS_ENV: &str = "CLAUDE_CODE_MAX_CONTEXT_TOKENS";
 
 struct Plan {
     root: PathBuf,
@@ -15,27 +16,39 @@ struct Plan {
     ports: [u16; 4],
     provider_keys: Vec<String>,
     max_output_tokens: Option<NonZeroU64>,
+    max_context_tokens: Option<NonZeroU64>,
 }
 
 fn plan(request: &RunRequest) -> Result<Plan, String> {
-    plan_with_output_tokens(request, std::env::var_os(MAX_OUTPUT_TOKENS_ENV))
+    plan_with_token_limits(
+        request,
+        std::env::var_os(MAX_OUTPUT_TOKENS_ENV),
+        std::env::var_os(MAX_CONTEXT_TOKENS_ENV),
+    )
 }
 
-fn plan_with_output_tokens(
-    request: &RunRequest,
-    output_tokens: Option<std::ffi::OsString>,
-) -> Result<Plan, String> {
-    let max_output_tokens = output_tokens
+fn positive_token_limit(
+    name: &str,
+    value: Option<std::ffi::OsString>,
+) -> Result<Option<NonZeroU64>, String> {
+    value
         .map(|value| {
             value
                 .to_str()
                 .filter(|value| !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()))
                 .and_then(|value| value.parse::<NonZeroU64>().ok())
-                .ok_or_else(|| {
-                    format!("{MAX_OUTPUT_TOKENS_ENV} must be a positive decimal u64 integer")
-                })
+                .ok_or_else(|| format!("{name} must be a positive decimal u64 integer"))
         })
-        .transpose()?;
+        .transpose()
+}
+
+fn plan_with_token_limits(
+    request: &RunRequest,
+    output_tokens: Option<std::ffi::OsString>,
+    context_tokens: Option<std::ffi::OsString>,
+) -> Result<Plan, String> {
+    let max_output_tokens = positive_token_limit(MAX_OUTPUT_TOKENS_ENV, output_tokens)?;
+    let max_context_tokens = positive_token_limit(MAX_CONTEXT_TOKENS_ENV, context_tokens)?;
     let root = request
         .fresh_profile
         .as_ref()
@@ -108,6 +121,7 @@ fn plan_with_output_tokens(
         config,
         ports,
         max_output_tokens,
+        max_context_tokens,
         provider_keys: parsed
             .endpoints
             .iter()
@@ -234,6 +248,10 @@ fn client_command(binary: &Path, request: &RunRequest, plan: &Plan) -> Command {
     command.env_remove(MAX_OUTPUT_TOKENS_ENV);
     if let Some(tokens) = plan.max_output_tokens {
         command.env(MAX_OUTPUT_TOKENS_ENV, tokens.to_string());
+    }
+    command.env_remove(MAX_CONTEXT_TOKENS_ENV);
+    if let Some(tokens) = plan.max_context_tokens {
+        command.env(MAX_CONTEXT_TOKENS_ENV, tokens.to_string());
     }
     if let Some(tokens) = request.auto_compact_window {
         command.env(crate::claude::AUTO_COMPACT_WINDOW_ENV, tokens.to_string());
@@ -528,7 +546,7 @@ mod tests {
             (Some("0001"), Some("1")),
             (Some("18446744073709551615"), Some("18446744073709551615")),
         ] {
-            let plan = plan_with_output_tokens(&request, input.map(OsString::from)).unwrap();
+            let plan = plan_with_token_limits(&request, input.map(OsString::from), None).unwrap();
             let client = client_command(Path::new("claude"), &request, &plan);
             let value = client
                 .get_envs()
@@ -560,7 +578,7 @@ mod tests {
             "512 ",
             "18446744073709551616",
         ] {
-            let error = plan_with_output_tokens(&request, Some(value.into()))
+            let error = plan_with_token_limits(&request, Some(value.into()), None)
                 .err()
                 .unwrap();
             assert_eq!(
@@ -573,7 +591,80 @@ mod tests {
         {
             use std::os::unix::ffi::OsStringExt;
             assert!(
-                plan_with_output_tokens(&request, Some(OsString::from_vec(vec![0xff]))).is_err()
+                plan_with_token_limits(&request, Some(OsString::from_vec(vec![0xff])), None)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn direct_context_budget_reaches_client_only_and_absence_keeps_default() {
+        let fixture = Fixture::new();
+        let request = fixture.request();
+        for (input, expected) in [
+            (None, None),
+            (Some("16384"), Some("16384")),
+            (Some("0001"), Some("1")),
+            (Some("18446744073709551615"), Some("18446744073709551615")),
+        ] {
+            let plan =
+                plan_with_token_limits(&request, Some("512".into()), input.map(OsString::from))
+                    .unwrap();
+            let client = client_command(Path::new("claude"), &request, &plan);
+            let value = client
+                .get_envs()
+                .find(|(key, _)| *key == MAX_CONTEXT_TOKENS_ENV)
+                .unwrap()
+                .1;
+            assert_eq!(value, expected.map(std::ffi::OsStr::new));
+            assert_eq!(
+                client
+                    .get_envs()
+                    .find(|(key, _)| *key == MAX_OUTPUT_TOKENS_ENV)
+                    .unwrap()
+                    .1,
+                Some(std::ffi::OsStr::new("512"))
+            );
+            let daemon = daemon_command_with_env(Path::new("rld"), &plan, |_| None);
+            assert!(
+                !daemon
+                    .get_envs()
+                    .any(|(key, value)| key == MAX_CONTEXT_TOKENS_ENV && value.is_some())
+            );
+            assert!(!plan.root.exists());
+        }
+    }
+
+    #[test]
+    fn invalid_context_budget_refuses_before_profile_or_config_access() {
+        let fixture = Fixture::new();
+        let mut request = fixture.request();
+        request.config_path = Some(fixture.0.join("nonexistent-config.json"));
+        for value in [
+            "",
+            "0",
+            "-1",
+            "1.5",
+            "16384x",
+            " 16384",
+            "16384 ",
+            "18446744073709551616",
+        ] {
+            let error = plan_with_token_limits(&request, None, Some(value.into()))
+                .err()
+                .unwrap();
+            assert_eq!(
+                error,
+                "CLAUDE_CODE_MAX_CONTEXT_TOKENS must be a positive decimal u64 integer"
+            );
+            assert!(!fixture.0.join("profile").exists());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            assert!(
+                plan_with_token_limits(&request, None, Some(OsString::from_vec(vec![0xff])))
+                    .is_err()
             );
         }
     }
