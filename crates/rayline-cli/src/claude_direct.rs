@@ -224,6 +224,15 @@ fn client_command(binary: &Path, request: &RunRequest, plan: &Plan) -> Command {
         )
         .env("ANTHROPIC_API_KEY", "rayline-local")
         .env("ANTHROPIC_MODEL", "rayline-arc")
+        .env("ANTHROPIC_CUSTOM_MODEL_OPTION", "rayline-arc")
+        .env(
+            "ANTHROPIC_CUSTOM_MODEL_OPTION_NAME",
+            "Rayline ARC — model routing",
+        )
+        .env(
+            "ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION",
+            "ARC selects the configured model endpoint for each turn.",
+        )
         .env("ANTHROPIC_DEFAULT_OPUS_MODEL", "rayline-arc")
         .env("ANTHROPIC_DEFAULT_SONNET_MODEL", "rayline-arc")
         .env("ANTHROPIC_DEFAULT_HAIKU_MODEL", "rayline-arc")
@@ -534,6 +543,41 @@ mod tests {
         assert!(!args.contains(&"--proxy-port".into()));
         assert!(args.windows(2).any(|v| v[0] == "--router-config-path"
             && v[1] == plan.root.join("router.json").to_string_lossy()));
+    }
+
+    #[test]
+    fn direct_custom_model_metadata_names_the_route_without_changing_model_identity() {
+        let fixture = Fixture::new();
+        let request = fixture.request();
+        let plan = plan(&request).unwrap();
+        let client = client_command(Path::new("claude"), &request, &plan);
+        for (key, expected) in [
+            ("ANTHROPIC_CUSTOM_MODEL_OPTION", "rayline-arc"),
+            (
+                "ANTHROPIC_CUSTOM_MODEL_OPTION_NAME",
+                "Rayline ARC — model routing",
+            ),
+            (
+                "ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION",
+                "ARC selects the configured model endpoint for each turn.",
+            ),
+            ("ANTHROPIC_MODEL", "rayline-arc"),
+            ("ANTHROPIC_DEFAULT_OPUS_MODEL", "rayline-arc"),
+            ("ANTHROPIC_DEFAULT_SONNET_MODEL", "rayline-arc"),
+            ("ANTHROPIC_DEFAULT_HAIKU_MODEL", "rayline-arc"),
+        ] {
+            assert_eq!(
+                client.get_envs().find(|(name, _)| *name == key).unwrap().1,
+                Some(std::ffi::OsStr::new(expected)),
+                "{key}"
+            );
+        }
+        let args: Vec<_> = client.get_args().collect();
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--model", "rayline-arc"])
+        );
+        assert!(!plan.root.exists());
     }
 
     #[test]

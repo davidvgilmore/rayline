@@ -312,6 +312,13 @@ onboard or download a generator. Start the installed session runtime, numerical
 worker and generation endpoints separately using their qualified settings.
 A ready daemon does not establish their readiness or numerical parity.
 
+The child registers the real `rayline-arc` route through Claude Code's
+[custom model option](https://code.claude.com/docs/en/model-config#add-a-custom-model-option),
+labeled “Rayline ARC — model routing.” This is picker metadata, not the name of
+a selected provider model; ARC still chooses the configured endpoint. Inherited
+custom model metadata is replaced in this child only. Claude diagnostics remain
+visible, and this registration does not guarantee every model warning is absent.
+
 The launcher supervises both the daemon and Claude Code. Its foreground daemon
 uses private data, configuration and logs under the new directory and dynamically
 allocated loopback ports. Claude receives a fresh configuration, empty settings
