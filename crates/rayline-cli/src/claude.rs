@@ -88,6 +88,8 @@ pub struct RunRequest {
     /// mirrored from the selected source profile, and daemon/runtime state stays
     /// local so two live supervisors never collide.
     pub isolated: bool,
+    pub fresh_profile: Option<PathBuf>,
+    pub direct_local: bool,
     pub local_injector_port: Option<u16>,
     pub routing_mode: RoutingMode,
     /// Whether the user pinned the proxy scope with `--route`. When false and
@@ -479,6 +481,22 @@ fn resolve_provider_model(
 }
 
 pub async fn run_command(request: &RunRequest) -> Result<Command, RunError> {
+    if request.direct_local {
+        return Err(RunError::Router(
+            "direct launches require the supervised CLI entrypoint".into(),
+        ));
+    }
+    if request
+        .config_path
+        .as_deref()
+        .is_some_and(crate::router_config::config_has_arc)
+        || request
+            .router_config_path
+            .as_deref()
+            .is_some_and(crate::router_config::config_has_arc)
+    {
+        return Err(RunError::Router("ARC client launches require --config, --via direct and --fresh-profile; proxy and overlay launches are not supported for ARC".into()));
+    }
     let home = dirs::home_dir().ok_or(RunError::HomeNotFound)?;
     let claude_bin = find_claude_bin(&home).ok_or(RunError::ClaudeMissing)?;
     run_command_from_home(request, &home, claude_bin).await
@@ -489,7 +507,7 @@ pub async fn run_command(request: &RunRequest) -> Result<Command, RunError> {
 /// non-interactive. Returns the exact flag the user passed, so messaging can
 /// name it.
 pub fn print_mode_flag(args: &[OsString]) -> Option<&'static str> {
-    args.iter().find_map(|arg| {
+    args.iter().take_while(|arg| *arg != "--").find_map(|arg| {
         if arg == "-p" {
             Some("-p")
         } else if arg == "--print" {
@@ -2503,7 +2521,7 @@ fn resolve_executable_in_dir(dir: &Path, name: &str) -> Option<PathBuf> {
 /// (`~/.claude/local`) wire `claude` onto `PATH` from `.zshrc`, so a PATH-only
 /// lookup misses it there even though an interactive terminal finds it fine.
 /// Probing the install dirs makes resolution independent of shell-init quirks.
-fn find_claude_bin(home: &Path) -> Option<PathBuf> {
+pub(crate) fn find_claude_bin(home: &Path) -> Option<PathBuf> {
     find_on_path("claude").or_else(|| first_existing_file(claude_fallback_candidates(home)))
 }
 

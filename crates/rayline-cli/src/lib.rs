@@ -8,6 +8,7 @@ pub(crate) mod auth_callback_page;
 pub mod catalog;
 pub mod claude;
 pub(crate) mod claude_daemon;
+mod claude_direct;
 pub mod codex;
 pub mod codex_app;
 pub mod discover;
@@ -129,9 +130,10 @@ Options:
                                     background agents
   --route <all|subagents>           What the proxy routes through the router
                                     (default: all for cloud, subagents for local)
-  --via <proxy|env>                 How Claude Code connects to the router
+  --fresh-profile <absolute-path>   New private client/state directory for direct ARC
+  --via <proxy|env|direct>                 How Claude Code connects to the router
                                     (default: proxy; env is lightweight,
-                                    cloud-only, no background process)
+                                    cloud-only; direct runs an ARC session host without a proxy)
   --local-injector-port <port>      Local injector port
   --statusline/--no-statusline      Show proxy picked model in status line
   --diagnose                        Print routing diagnostics before exec
@@ -1118,6 +1120,7 @@ where
     let mut local_provider = None;
     let mut local_router = false;
     let mut isolated = false;
+    let mut fresh_profile = None;
     let mut local_injector_port = None;
     // Two-axis routing intent, resolved into a RoutingMode at the end. `via`
     // selects the connection mechanism (proxy is the default; env is opt-in);
@@ -1178,6 +1181,10 @@ where
                 "--local-provider" => {
                     local_provider = Some(crate::providers::ProviderId::parse(value)?);
                     local_router = true;
+                    continue;
+                }
+                "--fresh-profile" => {
+                    fresh_profile = Some(PathBuf::from(value));
                     continue;
                 }
                 "--via" => {
@@ -1245,6 +1252,10 @@ where
                 local_router = true;
                 continue;
             }
+            "--fresh-profile" => {
+                fresh_profile = Some(PathBuf::from(args.next()?));
+                continue;
+            }
             "--isolated" => {
                 isolated = true;
                 continue;
@@ -1309,6 +1320,24 @@ where
     if config_path.is_some() && matches!(via, Some(ViaArg::Env)) {
         return None;
     }
+    let direct_local = matches!(via, Some(ViaArg::Direct));
+    if direct_local
+        && (fresh_profile.is_none()
+            || config_path.is_none()
+            || isolated
+            || local_provider.is_some()
+            || router_config_path.is_some()
+            || upstream_ca_path.is_some()
+            || matches!(route_scope, Some(RouteScope::Subagents))
+            || diagnose
+            || local_injector_port.is_some()
+            || root_auth_token.is_some())
+    {
+        return None;
+    }
+    if fresh_profile.is_some() && !direct_local {
+        return None;
+    }
     let routing_mode = resolve_routing_mode(local_router, via, route_scope)?;
 
     Some(crate::claude::RunRequest {
@@ -1321,6 +1350,8 @@ where
         auto_compact_window,
         local_router,
         isolated,
+        fresh_profile,
+        direct_local,
         local_injector_port,
         routing_mode,
         route_scope_explicit: route_scope.is_some(),
@@ -1337,6 +1368,7 @@ where
 /// `proxy` is the default; `env` is the lightweight, cloud-only opt-in.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ViaArg {
+    Direct,
     Env,
     Proxy,
 }
@@ -1350,6 +1382,7 @@ enum RouteScope {
 
 fn parse_via(value: &str) -> Option<ViaArg> {
     match value {
+        "direct" => Some(ViaArg::Direct),
         "env" => Some(ViaArg::Env),
         "proxy" => Some(ViaArg::Proxy),
         _ => None,
@@ -1421,6 +1454,7 @@ fn resolve_routing_mode(
     });
 
     match via {
+        Some(ViaArg::Direct) => Some(RoutingMode::Proxy),
         Some(ViaArg::Env) => {
             // The env mechanism is cloud-only and cannot route selectively.
             if local_router {
@@ -2122,6 +2156,15 @@ fn root_version_requested(original_argv: &[OsString]) -> bool {
 }
 
 async fn exec_claude(request: crate::claude::RunRequest) -> ExitCode {
+    if request.direct_local {
+        return match claude_direct::run(&request).await {
+            Ok(code) => ExitCode::from(code),
+            Err(error) => {
+                eprintln!("Error: {error}");
+                ExitCode::from(1)
+            }
+        };
+    }
     let print_mode = crate::claude::print_mode_flag(&request.args).is_some();
     let mut command = match crate::claude::run_command(&request).await {
         Ok(command) => command,
@@ -2285,6 +2328,7 @@ fn is_value_option(arg: &str) -> bool {
             | "--local-injector-port"
             | "--upstream-ca-path"
             | "--router-config-path"
+            | "--fresh-profile"
             | "--lines"
             | "--channel"
             | "--url"

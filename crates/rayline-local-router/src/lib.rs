@@ -5,6 +5,10 @@
 //! OSS-shaped milestone local/client-side only: static rules, configured
 //! provider endpoints, and local-model redirects.
 
+pub mod arc;
+mod arc_chat;
+pub mod arc_session;
+
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::fs;
@@ -79,6 +83,9 @@ impl Default for LocalRouterOptions {
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct RouterConfig {
+    /// Experimental local ARC worker and explicit action bindings.
+    #[serde(default)]
+    pub arc: Option<arc::ArcConfig>,
     #[serde(default)]
     pub endpoints: Vec<EndpointConfig>,
     #[serde(default)]
@@ -333,6 +340,9 @@ fn load_config(opts: &LocalRouterOptions) -> Result<RouterConfig> {
 }
 
 fn merge_config(config: &mut RouterConfig, overrides: RouterConfig) {
+    if overrides.arc.is_some() {
+        config.arc = overrides.arc;
+    }
     for endpoint in overrides.endpoints {
         if let Some(existing) = config
             .endpoints
@@ -372,6 +382,9 @@ fn merge_config(config: &mut RouterConfig, overrides: RouterConfig) {
 }
 
 fn normalize_config(config: &mut RouterConfig, local_model_id: &str) -> Result<()> {
+    if let Some(arc) = &config.arc {
+        arc.validate(config)?;
+    }
     for endpoint in &config.endpoints {
         validate_endpoint(endpoint)?;
         if endpoint_hidden_from_catalog(endpoint) {
@@ -462,6 +475,7 @@ fn normalize_route_target(route: &mut RouteTarget, local_model_id: &str) -> Resu
 
 fn default_config(local_model_id: &str) -> RouterConfig {
     RouterConfig {
+        arc: None,
         endpoints: vec![
             EndpointConfig {
                 id: "anthropic".to_owned(),
@@ -1135,9 +1149,33 @@ async fn count_responses_tokens_response(req: Request<Incoming>) -> Response<Box
 async fn handle_messages(state: AppState, req: Request<Incoming>) -> Result<Response<BoxBody>> {
     let t_start = Instant::now();
     let headers = req.headers().clone();
-    let body = req.into_body().collect().await?.to_bytes();
-    let parsed = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
-    let decision = select_route_with_warn(&state, &headers, &parsed, ApiSurface::Anthropic);
+    let mut body = req.into_body().collect().await?.to_bytes();
+    let mut parsed = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
+    let mut session_turn = None;
+    let decision = if parsed.get("model").and_then(Value::as_str) == Some(arc::VIRTUAL_MODEL) {
+        let decision = if parsed.get("rayline_arc").is_none()
+            && state
+                .config
+                .arc
+                .as_ref()
+                .is_some_and(|arc| arc.session.is_some())
+        {
+            let (decision, turn) = arc_session::prepare(&state, &headers, &mut parsed).await?;
+            session_turn = Some(turn);
+            decision
+        } else {
+            arc::route(&state, &mut parsed).await?
+        };
+        body = Bytes::from(serde_json::to_vec(&parsed)?);
+        decision
+    } else {
+        if parsed.get("rayline_arc").is_some() {
+            return Err(anyhow!(
+                "rayline_arc context requires the rayline-arc virtual model"
+            ));
+        }
+        select_route_with_warn(&state, &headers, &parsed, ApiSurface::Anthropic)
+    };
     let request_id = headers
         .get(REQUEST_ID_HEADER)
         .and_then(header_str)
@@ -1216,8 +1254,18 @@ async fn handle_messages(state: AppState, req: Request<Incoming>) -> Result<Resp
                     .await
                 }
                 EndpointProtocol::OpenAIChat => {
-                    forward_openai_chat_endpoint(&state, endpoint, &decision, parsed, &request_id)
+                    if let Some(codec) = session_turn.as_ref().and_then(|turn| turn.codec.clone()) {
+                        arc_chat::forward(&state, endpoint, parsed, codec).await
+                    } else {
+                        forward_openai_chat_endpoint(
+                            &state,
+                            endpoint,
+                            &decision,
+                            parsed,
+                            &request_id,
+                        )
                         .await
+                    }
                 }
                 EndpointProtocol::OpenAIResponses => Err(anyhow!(
                     "endpoint {:?} uses openai_responses, which is only supported for /v1/responses requests",
@@ -1227,7 +1275,10 @@ async fn handle_messages(state: AppState, req: Request<Incoming>) -> Result<Resp
             if let Err(error) = response.as_ref() {
                 record_request_error(state.opts.metrics.as_ref(), &request_id, None, error);
             }
-            response
+            match (response, session_turn) {
+                (Ok(response), Some(turn)) => Ok(turn.observe(response)),
+                (response, _) => response,
+            }
         }
     }
 }
@@ -1237,6 +1288,13 @@ async fn handle_responses(state: AppState, req: Request<Incoming>) -> Result<Res
     let headers = req.headers().clone();
     let body = req.into_body().collect().await?.to_bytes();
     let parsed = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
+    if parsed.get("model").and_then(Value::as_str) == Some(arc::VIRTUAL_MODEL)
+        || parsed.get("rayline_arc").is_some()
+    {
+        return Err(anyhow!(
+            "experimental ARC routing currently requires /v1/messages"
+        ));
+    }
     let decision = select_route_with_warn(&state, &headers, &parsed, ApiSurface::Codex);
     let request_id = request_id_from_headers(&headers);
     let output_kind = responses_output_kind(&parsed);
@@ -1345,6 +1403,13 @@ async fn handle_openai_passthrough_family(
     let headers = req.headers().clone();
     let body = req.into_body().collect().await?.to_bytes();
     let parsed = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
+    if parsed.get("model").and_then(Value::as_str) == Some(arc::VIRTUAL_MODEL)
+        || parsed.get("rayline_arc").is_some()
+    {
+        return Err(anyhow!(
+            "experimental ARC routing currently requires /v1/messages"
+        ));
+    }
     let decision = select_route_with_warn(&state, &headers, &parsed, ApiSurface::Codex);
     let request_id = request_id_from_headers(&headers);
     forward_openai_family_or_unsupported(
@@ -1376,6 +1441,13 @@ async fn handle_openai_auxiliary(
     let headers = req.headers().clone();
     let body = req.into_body().collect().await?.to_bytes();
     let parsed = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
+    if parsed.get("model").and_then(Value::as_str) == Some(arc::VIRTUAL_MODEL)
+        || parsed.get("rayline_arc").is_some()
+    {
+        return Err(anyhow!(
+            "experimental ARC routing currently requires /v1/messages"
+        ));
+    }
     let decision = select_route_with_warn(&state, &headers, &parsed, ApiSurface::Codex);
     let request_id = request_id_from_headers(&headers);
 
@@ -2529,7 +2601,9 @@ async fn forward_anthropic_endpoint(
 ) -> Result<Response<BoxBody>> {
     let mut parsed = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
     rewrite_body_model(&mut parsed, &decision.selected_model);
-    adapt_anthropic_body_for_model(&mut parsed, &decision.selected_model);
+    if decision.policy != "arc_session" {
+        adapt_anthropic_body_for_model(&mut parsed, &decision.selected_model);
+    }
     let outbound_body = serde_json::to_vec(&parsed).unwrap_or_else(|_| body.to_vec());
     let url = format!("{}/v1/messages", endpoint.base_url.trim_end_matches('/'));
     let mut outbound = state
@@ -2828,6 +2902,7 @@ async fn response_from_reqwest(
     // Prefer the upstream-reported model (native passthrough) over the sentinel.
     let selected_model =
         prefer_upstream_selected_model(upstream_selected_model.as_deref(), decision);
+    let cancel_on_disconnect = decision.is_some_and(|decision| decision.policy == "arc_session");
     // Body accumulation is only needed for end-of-stream usage extraction when metrics are active.
     // Mirror the proxy's observe_response gate so large responses are not buffered unnecessarily.
     let has_metrics = metrics.is_some() && request_id.is_some();
@@ -2849,7 +2924,15 @@ async fn response_from_reqwest(
             output_tokens,
             selected_model.clone(),
         );
-        while let Some(chunk) = stream.next().await {
+        loop {
+            let next = if cancel_on_disconnect {
+                tokio::select! { biased; _ = tx.closed() => break, next = stream.next() => next }
+            } else {
+                stream.next().await
+            };
+            let Some(chunk) = next else {
+                break;
+            };
             match chunk {
                 Ok(bytes) => {
                     if !saw_first_token {
@@ -2885,6 +2968,9 @@ async fn response_from_reqwest(
                     retain_for_metrics(has_metrics, &mut body, &bytes);
                     if downstream_open && tx.send(Ok(Frame::data(bytes))).await.is_err() {
                         downstream_open = false;
+                        if cancel_on_disconnect {
+                            break;
+                        }
                     }
                 }
                 Err(error) => {
