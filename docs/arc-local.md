@@ -360,3 +360,72 @@ generator onboarding, hosted routing, or a shared-profile proxy. The Codex
 launcher and Codex desktop use Responses and remain outside this Messages-only
 integration. Source and synthetic tests do not establish real-client or numerical
 acceptance; qualify the exact installed launcher/runtime before relying on it.
+
+## Cloud-generation integration preview
+
+The preview runs the small ARC encoder and routing heads locally, then sends
+selected generation requests to configured cloud providers. It is not a claim
+of numerical parity with the reference runtime. The full action catalog stays
+available; a successful request to one destination does not qualify every cloud
+provider or model.
+
+Use the supplied private **OPERATOR-PREVIEW.md** and its pinned checkpoint
+manifest. That guide gives exact Hugging Face acquisition, checksum verification,
+installation, export, foreground startup and shutdown commands for this kit.
+Its `ARC_WORK` is a new owned absolute directory; `ARC_INSTALL` is the selected
+host installation, `ARC_CONFIG` is the exported `rayline-router.json`, and
+`ARC_NEW_PROFILE` is a new absolute client-profile path. Keep its source pins, checksums, licenses and install receipt.
+Do not substitute an unpinned archive or commit weights or credentials here.
+The kit supplies separate native, session, setup and host components. Installation
+alone does not start them or establish a working route.
+
+Use the installed setup helper to export a Rayline configuration from the exact
+package and provider settings. Keep all action bindings. Configure three distinct
+connections: the session service calls the local numerical endpoint; Rayline
+calls the local session endpoint; the selected generation endpoint is cloud
+HTTPS. Use the configured codec hash returned by `arc-session --describe-config`
+with those same settings. A settings change can change that identity.
+
+For an isolated client, start the native and session services according to the
+kit, then use the installed CLI:
+
+```sh
+ARC_CONFIG="$ARC_EXPORT/rayline-router.json"
+ARC_NEW_PROFILE="$ARC_WORK/profiles/new-rayline"
+RLD_BIN="$ARC_INSTALL/host/bin/rld" \
+CLAUDE_CODE_MAX_CONTEXT_TOKENS=16384 \
+CLAUDE_CODE_MAX_OUTPUT_TOKENS=4096 \
+  "$ARC_INSTALL/host/bin/rayline" claude \
+  --config "$ARC_CONFIG" --via direct \
+  --fresh-profile "$ARC_NEW_PROFILE"
+```
+
+These limits are explicit example values for the preview deployment, not defaults
+for every router. `ARC_NEW_PROFILE` must be a new absolute path. Keep the host
+and daemon from the same installation. The launcher configures its owned processes and fresh profile without writing
+normal Claude or terminal settings. A concurrent shared-file hash change alone
+does not identify which process wrote it. The direct launcher starts its daemon with
+`--no-local-model`; no generation model should be downloaded or loaded for this
+cloud preview. A separate local Qwen3.8-27B configuration must remain unselected
+and disconnected from active routes. Do not use it as a fallback on this Mac.
+
+Native thinking controls belong to the selected provider profile. Stage 2's
+private append is separate: it modifies eligible message positions through the
+session's pinned planner, without changing the native thinking setting. Inspect
+the actual prepared request and ledger when diagnosing an append; a selected
+level alone does not prove that text was emitted.
+
+Rayline creates a new operation ID for each HTTP attempt. Repeating a request
+is not an idempotent public request-ID replay. After an acknowledged abort, a new
+attempt can proceed. Repeating committed history can replay an existing private
+instruction without appending it twice. An uncertain prepare or settlement fences
+the owner instead; do not bypass that fence with repeated calls or a restart.
+
+If setup fails, keep the first error and receipts. Check endpoint readiness,
+package and codec identity, the complete action map, native session identity and
+provider authentication at their respective boundaries. Do not replace missing
+usage with zero or infer cache hits from cache directives alone. A provider's
+reported cost is not its final bill. Responses ingress, durable restart recovery,
+all-provider availability and numerical parity remain outside this preview.
+
+The future local option names the [ggml-org published GGUF candidate](https://huggingface.co/ggml-org/Qwen3.8-27B-GGUF/tree/71bc7b627595dc8a91039addd9c791ae548d6747). This is an identity reference, not a download or launch instruction. Mac serving, quantization choice and local ARC profile qualification remain untested; keep the candidate mapping unselected.
