@@ -253,6 +253,10 @@ dispatch to a prepared Chat endpoint. Responses ingress and durable codec-stream
 restart are not supported by this mode. The private service and codec are
 operator-managed dependencies and are not included in the public repository.
 
+### Interactive launcher version
+
+Interactive `--via direct` requires commit `231eafbf47bbf09952e593b5efc16b0d07d6827e` or a later version retaining its persistence fix. Earlier preview binaries always passed `--no-session-persistence`, which Claude permits only with `--print`. Use matching `rayline` and `rld` binaries from the same build; do not treat an older print-mode transport test as interactive qualification. With the pinned toolchain and cached dependencies, build both with `cargo +1.88.0 build --offline --release --locked -p rayline-cli -p rayline-daemon`.
+
 ### Use an installed session runtime
 
 The ARC session service is an operator-managed dependency. If your deployment
