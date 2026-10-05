@@ -323,6 +323,13 @@ shared daemon registry. The fresh client disables the background agent view;
 its lifetime belongs to this foreground launch. It keeps the caller's working
 directory and HOME.
 
+To set Claude's output-token limit explicitly, set
+`CLAUDE_CODE_MAX_OUTPUT_TOKENS` before launching direct mode, for example
+`CLAUDE_CODE_MAX_OUTPUT_TOKENS=512 rayline claude ...`. The launcher validates a
+positive decimal `u64` integer before creating the profile or starting processes
+and forwards it only to Claude. Unset leaves Claude's default unchanged; invalid,
+zero or overflowing values fail clearly. Model/provider limits still apply.
+
 Exit Claude or interrupt the launcher to stop its owned daemon and client
 processes. The private directory and logs remain for inspection. Each launch
 requires a new directory; resume/continue and client overrides that would select

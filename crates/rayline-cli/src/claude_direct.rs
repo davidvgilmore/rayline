@@ -1,19 +1,41 @@
 use std::fs;
 use std::net::TcpListener;
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use crate::claude::RunRequest;
 
+const MAX_OUTPUT_TOKENS_ENV: &str = "CLAUDE_CODE_MAX_OUTPUT_TOKENS";
+
 struct Plan {
     root: PathBuf,
     config: Vec<u8>,
     ports: [u16; 4],
     provider_keys: Vec<String>,
+    max_output_tokens: Option<NonZeroU64>,
 }
 
 fn plan(request: &RunRequest) -> Result<Plan, String> {
+    plan_with_output_tokens(request, std::env::var_os(MAX_OUTPUT_TOKENS_ENV))
+}
+
+fn plan_with_output_tokens(
+    request: &RunRequest,
+    output_tokens: Option<std::ffi::OsString>,
+) -> Result<Plan, String> {
+    let max_output_tokens = output_tokens
+        .map(|value| {
+            value
+                .to_str()
+                .filter(|value| !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()))
+                .and_then(|value| value.parse::<NonZeroU64>().ok())
+                .ok_or_else(|| {
+                    format!("{MAX_OUTPUT_TOKENS_ENV} must be a positive decimal u64 integer")
+                })
+        })
+        .transpose()?;
     let root = request
         .fresh_profile
         .as_ref()
@@ -85,6 +107,7 @@ fn plan(request: &RunRequest) -> Result<Plan, String> {
         root: root.clone(),
         config,
         ports,
+        max_output_tokens,
         provider_keys: parsed
             .endpoints
             .iter()
@@ -207,6 +230,11 @@ fn client_command(binary: &Path, request: &RunRequest, plan: &Plan) -> Command {
         .arg(plan.root.join("mcp.json"))
         .args(["--no-chrome", "--no-session-persistence"])
         .args(&request.args);
+    // Apply only the validated planning snapshot after the customization scrub.
+    command.env_remove(MAX_OUTPUT_TOKENS_ENV);
+    if let Some(tokens) = plan.max_output_tokens {
+        command.env(MAX_OUTPUT_TOKENS_ENV, tokens.to_string());
+    }
     if let Some(tokens) = request.auto_compact_window {
         command.env(crate::claude::AUTO_COMPACT_WINDOW_ENV, tokens.to_string());
     }
@@ -488,6 +516,66 @@ mod tests {
         assert!(!args.contains(&"--proxy-port".into()));
         assert!(args.windows(2).any(|v| v[0] == "--router-config-path"
             && v[1] == plan.root.join("router.json").to_string_lossy()));
+    }
+
+    #[test]
+    fn direct_output_cap_reaches_client_only_and_absence_keeps_client_default() {
+        let fixture = Fixture::new();
+        let request = fixture.request();
+        for (input, expected) in [
+            (None, None),
+            (Some("512"), Some("512")),
+            (Some("0001"), Some("1")),
+            (Some("18446744073709551615"), Some("18446744073709551615")),
+        ] {
+            let plan = plan_with_output_tokens(&request, input.map(OsString::from)).unwrap();
+            let client = client_command(Path::new("claude"), &request, &plan);
+            let value = client
+                .get_envs()
+                .find(|(key, _)| *key == MAX_OUTPUT_TOKENS_ENV)
+                .unwrap()
+                .1;
+            assert_eq!(value, expected.map(std::ffi::OsStr::new));
+            let daemon = daemon_command_with_env(Path::new("rld"), &plan, |_| None);
+            assert!(
+                !daemon
+                    .get_envs()
+                    .any(|(key, value)| key == MAX_OUTPUT_TOKENS_ENV && value.is_some())
+            );
+            assert!(!plan.root.exists());
+        }
+    }
+
+    #[test]
+    fn invalid_direct_output_cap_fails_before_profile_creation() {
+        let fixture = Fixture::new();
+        let request = fixture.request();
+        for value in [
+            "",
+            "0",
+            "-1",
+            "1.5",
+            "512x",
+            " 512",
+            "512 ",
+            "18446744073709551616",
+        ] {
+            let error = plan_with_output_tokens(&request, Some(value.into()))
+                .err()
+                .unwrap();
+            assert_eq!(
+                error,
+                "CLAUDE_CODE_MAX_OUTPUT_TOKENS must be a positive decimal u64 integer"
+            );
+            assert!(!fixture.0.join("profile").exists());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            assert!(
+                plan_with_output_tokens(&request, Some(OsString::from_vec(vec![0xff]))).is_err()
+            );
+        }
     }
 
     #[test]
