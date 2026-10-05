@@ -329,6 +329,9 @@ uses no interception proxy, CA registration, OAuth login, browser launch, or
 shared daemon registry. The fresh client disables the background agent view;
 its lifetime belongs to this foreground launch. It keeps the caller's working
 directory and HOME.
+Interactive sessions may persist inside that fresh profile. For explicit
+`--print` or `-p` mode, the launcher also disables session persistence; Claude
+Code does not support that flag in interactive mode.
 
 To set Claude's output-token limit explicitly, set
 `CLAUDE_CODE_MAX_OUTPUT_TOKENS` before launching direct mode, for example

@@ -251,8 +251,11 @@ fn client_command(binary: &Path, request: &RunRequest, plan: &Plan) -> Command {
         .arg(plan.root.join("settings.json"))
         .args(["--strict-mcp-config", "--mcp-config"])
         .arg(plan.root.join("mcp.json"))
-        .args(["--no-chrome", "--no-session-persistence"])
-        .args(&request.args);
+        .arg("--no-chrome");
+    if crate::claude::print_mode_flag(&request.args).is_some() {
+        command.arg("--no-session-persistence");
+    }
+    command.args(&request.args);
     // Apply only the validated planning snapshot after the customization scrub.
     command.env_remove(MAX_OUTPUT_TOKENS_ENV);
     if let Some(tokens) = plan.max_output_tokens {
@@ -578,6 +581,40 @@ mod tests {
                 .any(|pair| pair == ["--model", "rayline-arc"])
         );
         assert!(!plan.root.exists());
+    }
+
+    #[test]
+    fn direct_session_persistence_flag_is_print_only() {
+        let fixture = Fixture::new();
+        for (forwarded, print) in [
+            (vec![], false),
+            (vec!["interactive prompt"], false),
+            (vec!["--print", "prompt"], true),
+            (vec!["-p", "prompt"], true),
+            (vec!["--", "--print"], false),
+            (vec!["--", "-p"], false),
+            (vec!["--print", "--", "prompt"], true),
+        ] {
+            let mut request = fixture.request();
+            request.args = forwarded.iter().map(OsString::from).collect();
+            let plan = plan(&request).unwrap();
+            let client = client_command(Path::new("claude"), &request, &plan);
+            let args: Vec<_> = client.get_args().collect();
+            assert_eq!(
+                args.contains(&std::ffi::OsStr::new("--no-session-persistence")),
+                print
+            );
+            assert!(
+                args.ends_with(
+                    &request
+                        .args
+                        .iter()
+                        .map(|s| s.as_os_str())
+                        .collect::<Vec<_>>()
+                )
+            );
+            assert!(!plan.root.exists());
+        }
     }
 
     #[test]

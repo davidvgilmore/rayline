@@ -507,7 +507,7 @@ pub async fn run_command(request: &RunRequest) -> Result<Command, RunError> {
 /// non-interactive. Returns the exact flag the user passed, so messaging can
 /// name it.
 pub fn print_mode_flag(args: &[OsString]) -> Option<&'static str> {
-    args.iter().find_map(|arg| {
+    args.iter().take_while(|arg| *arg != "--").find_map(|arg| {
         if arg == "-p" {
             Some("-p")
         } else if arg == "--print" {
